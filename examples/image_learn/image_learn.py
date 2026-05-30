@@ -1,0 +1,306 @@
+#!/usr/bin/env uv run -S
+# /// script
+# dependencies = ["slangpy", "pillow", "numpy", "matplotlib"]
+# ///
+
+"""
+TSNN image-learning example (SlangPy)
+Trains a hash-grid MLP (16 levels x2 features, 4 hidden layers of 64) to
+reproduce a target image using the same three-kernel loop as the Falcor
+SlangMLP render pass — but driven entirely from Python via SlangPy.
+
+Three kernels (matching the Falcor pass pattern):
+  1. Train    — forward + backward, accumulates gradients
+  2. Optimize — Adam step, clears gradients
+  3. Infer    — full-image forward pass for evaluation / export
+
+Dependencies:
+    pip install slangpy torch pillow numpy matplotlib
+
+Usage:
+    python image_learn.py --image path/to/image.png
+    python image_learn.py              # procedural colour-wheel target
+"""
+
+import argparse
+import math
+import time
+from pathlib import Path
+import slangpy as spy
+import numpy as np
+
+# ─── Layout constants (must match Config.slang) ───────────────────────────────
+
+HASH_LEVELS = 16
+HASH_FEATURES = 2
+HASH_LOG2_TABLE = 19
+HASH_TABLE_SIZE = 1 << HASH_LOG2_TABLE
+HASH_BASE_RES = 16
+HASH_SCALE = 1.5
+
+HIDDEN_SIZE = 64
+INPUT_SIZE = HASH_LEVELS * HASH_FEATURES  # 32
+OUTPUT_SIZE = 3
+HIDDEN_LAYERS = 4
+TRANSITIONS = HIDDEN_LAYERS + 1
+
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+ADAM_EPSILON = 1e-8
+LOSS_SCALE = 1.0
+
+BATCH_SIZE = 1 << 14  # 16 384 pixels per step
+STEPS = 5_000
+LR = 1e-3
+DISPLAY_EVERY = 200
+RESOLUTION = 512
+
+
+# ─── Parameter-count helper (mirrors Config.slang::getParamCount) ─────────────
+
+
+def _align4(x: int) -> int:
+    return (x + 3) & ~3
+
+
+def layer_input(i):
+    return INPUT_SIZE if i == 0 else HIDDEN_SIZE
+
+
+def layer_output(i):
+    return OUTPUT_SIZE if i == TRANSITIONS - 1 else HIDDEN_SIZE
+
+
+def param_element_count() -> int:
+    return sum(
+        layer_input(i) * layer_output(i) + layer_output(i) for i in range(TRANSITIONS)
+    )
+
+
+def encoding_param_element_count() -> int:
+    return HASH_LEVELS * HASH_TABLE_SIZE * HASH_FEATURES
+
+
+PARAM_COUNT = param_element_count()
+ENC_PARAM_COUNT = encoding_param_element_count()
+
+PARAM_BYTES = _align4(PARAM_COUNT * 2)  # float16
+ENC_PARAM_BYTES = _align4(ENC_PARAM_COUNT * 2)
+MOMENT_BYTES = PARAM_COUNT * 4  # float32
+ENC_GRAD_BYTES = _align4(ENC_PARAM_COUNT * 4)
+ENC_MOMENT_BYTES = _align4(ENC_PARAM_COUNT * 4)
+
+
+# ─── Target image helpers ─────────────────────────────────────────────────────
+
+
+def make_procedural(res: int) -> np.ndarray:
+    y, x = np.mgrid[0:res, 0:res] / (res - 1.0)
+    r = np.sqrt((x - 0.5) ** 2 + (y - 0.5) ** 2)
+    theta = np.arctan2(y - 0.5, x - 0.5) / (2 * math.pi) + 0.5
+    R = np.clip(np.sin(theta * math.pi * 2) * 0.5 + 0.5, 0, 1)
+    G = np.clip(np.cos(theta * math.pi * 2) * 0.5 + 0.5, 0, 1)
+    B = np.clip(1.0 - r, 0, 1)
+    return np.stack([R, G, B], axis=-1).astype(np.float32)  # [H, W, 3]
+
+
+def load_image(path: str, res: int) -> np.ndarray:
+    from PIL import Image
+
+    img = Image.open(path).convert("RGB").resize((res, res))
+    return np.array(img, dtype=np.float32) / 255.0
+
+
+# ─── Buffer utilities ─────────────────────────────────────────────────────────
+
+
+def create_buffer(device, size_bytes: int, is_rw: bool = False) -> spy.Buffer:
+    usage = spy.BufferUsage.shader_resource
+    if is_rw:
+        usage |= spy.BufferUsage.unordered_access
+    return device.create_buffer(size=size_bytes, usage=usage)
+
+
+def create_texture(
+    device, width: int, height: int, data: np.ndarray = None
+) -> spy.Texture:
+    return device.create_texture(
+        width=width,
+        height=height,
+        format=spy.Format.rgba32_float,
+        usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
+        data=data,
+    )
+
+
+def upload_texture(device, data: np.ndarray) -> spy.Texture:
+    H, W = data.shape[:2]
+    rgba = np.concatenate([data, np.ones((H, W, 1), dtype=np.float32)], axis=-1)
+    tex = create_texture(device, W, H, data=rgba)
+    return tex
+
+
+def download_texture(tex: spy.Texture, H: int, W: int) -> np.ndarray:
+    return tex.to_numpy()[:H, :W, :3]
+
+
+# ─── Kernel helpers ───────────────────────────────────────────────────────────
+
+
+class ImageLearner:
+    def __init__(self, device, target: np.ndarray):
+        self.device = device
+        self.H, self.W = target.shape[:2]
+
+        # Load and upload target image
+        self.target_tex = upload_texture(device, target)
+
+        # GPU buffers
+        self.params = create_buffer(device, PARAM_BYTES, is_rw=True)
+        self.param_grads = create_buffer(device, PARAM_BYTES, is_rw=True)
+        self.moments1 = create_buffer(device, MOMENT_BYTES, is_rw=True)
+        self.moments2 = create_buffer(device, MOMENT_BYTES, is_rw=True)
+        self.enc_params = create_buffer(device, ENC_PARAM_BYTES, is_rw=True)
+        self.enc_grads = create_buffer(device, ENC_GRAD_BYTES, is_rw=True)
+        self.enc_moments1 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
+        self.enc_moments2 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
+        self.output_tex = create_texture(device, self.W, self.H)
+
+        # Load shaders
+        shader_dir = Path(__file__).parent
+        self.train_mod = spy.Module.load_from_file(
+            device, str(shader_dir / "Train.cs.slang")
+        )
+        self.optimize_mod = spy.Module.load_from_file(
+            device, str(shader_dir / "Optimize.cs.slang")
+        )
+        self.infer_mod = spy.Module.load_from_file(
+            device, str(shader_dir / "Infer.cs.slang")
+        )
+
+        # Reset parameters
+        dispatch_count = 256 * 8
+        self.optimize_mod.resetMain.dispatch(
+            thread_count=[dispatch_count, 1, 1],
+            gParams=self.params,
+            gParamGrads=self.param_grads,
+            gMoments1=self.moments1,
+            gMoments2=self.moments2,
+            gEncodingParams=self.enc_params,
+            gEncodingParamGrads=self.enc_grads,
+            gEncodingMoments1=self.enc_moments1,
+            gEncodingMoments2=self.enc_moments2,
+            CB={
+                "gLearningRate": LR,
+                "gCurrentStep": 1.0,
+                "gDispatchThreadCount": dispatch_count,
+            },
+        )
+
+    def train_step(self, step: int):
+        self.train_mod.trainMain.dispatch(
+            thread_count=[BATCH_SIZE, 1, 1],
+            gTarget=self.target_tex,
+            gParams=self.params,
+            gParamGrads=self.param_grads,
+            gEncodingParams=self.enc_params,
+            gEncodingParamGrads=self.enc_grads,
+            CB={
+                "gFrameDim": [self.W, self.H],
+                "gBatchSize": BATCH_SIZE,
+                "gCurrentStep": step,
+                "gFrameIndex": step,
+            },
+        )
+
+    def optimize_step(self, step: int, lr: float):
+        dispatch_count = 256 * 8
+        self.optimize_mod.optimizeMain.dispatch(
+            thread_count=[dispatch_count, 1, 1],
+            gParams=self.params,
+            gParamGrads=self.param_grads,
+            gMoments1=self.moments1,
+            gMoments2=self.moments2,
+            gEncodingParams=self.enc_params,
+            gEncodingParamGrads=self.enc_grads,
+            gEncodingMoments1=self.enc_moments1,
+            gEncodingMoments2=self.enc_moments2,
+            CB={
+                "gLearningRate": lr,
+                "gCurrentStep": float(step),
+                "gDispatchThreadCount": dispatch_count,
+            },
+        )
+
+    def infer(self) -> np.ndarray:
+        self.infer_mod.inferMain.dispatch(
+            thread_count=[(self.W + 7) // 8 * 8, (self.H + 7) // 8 * 8, 1],
+            gParams=self.params,
+            gEncodingParams=self.enc_params,
+            gOutput=self.output_tex,
+            CB={"gFrameDim": [self.W, self.H]},
+        )
+        return download_texture(self.output_tex, self.H, self.W)
+
+    def mse(self, pred: np.ndarray, target: np.ndarray) -> float:
+        return float(np.mean((pred - target) ** 2))
+
+
+# ─── Training loop ────────────────────────────────────────────────────────────
+
+
+def train(target: np.ndarray, device):
+    learner = ImageLearner(device, target)
+    print(f"Parameters: {PARAM_COUNT:,} (MLP) + {ENC_PARAM_COUNT:,} (hash grid)")
+    print(f"Training for {STEPS} steps, batch size {BATCH_SIZE}")
+
+    t0 = time.time()
+    for step in range(1, STEPS + 1):
+        learner.train_step(step)
+        learner.optimize_step(step, LR)
+
+        if step % DISPLAY_EVERY == 0 or step == 1:
+            pred = learner.infer()
+            mse = learner.mse(pred, target)
+            psnr = -10 * math.log10(max(mse, 1e-10))
+            elapsed = time.time() - t0
+            print(f"step {step:5d}/{STEPS} | PSNR {psnr:6.2f} dB | {elapsed:.1f}s")
+
+    return learner
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", default=None, help="Input image path")
+    parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--res", type=int, default=RESOLUTION)
+    parser.add_argument("--out", default="result.png")
+    args = parser.parse_args()
+
+    target = (
+        load_image(args.image, args.res) if args.image else make_procedural(args.res)
+    )
+    print(f"Target: {target.shape[1]}x{target.shape[0]}")
+
+    device = spy.create_device(
+        include_paths=[
+            Path(__file__).parent.absolute(),
+            Path(__file__).parent.parent.parent.absolute(),
+            Path(__file__).parent.parent.parent.absolute() / "TSNN",
+        ]
+    )
+    learner = train(target, device)
+
+    pred = learner.infer()
+    from PIL import Image
+
+    Image.fromarray((pred.clip(0, 1) * 255).astype(np.uint8)).save(args.out)
+    print(f"Result saved → {args.out}")
+
+
+if __name__ == "__main__":
+    main()
