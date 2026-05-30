@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["slangpy", "pillow", "numpy", "matplotlib", "tqdm"]
+# dependencies = ["slangpy", "numpy", "tqdm"]
 # ///
 
 import argparse
@@ -86,10 +86,9 @@ def make_procedural(res: int) -> np.ndarray:
 
 
 def load_image(path: str, res: int) -> np.ndarray:
-    from PIL import Image
-
-    img = Image.open(path).convert("RGB").resize((res, res))
-    return np.array(img, dtype=np.float32) / 255.0
+    # Use slangpy.Bitmap to load and convert images (avoids Pillow dependency)
+    bmp = spy.Bitmap(path).convert(pixel_format=spy.Bitmap.PixelFormat.rgb)
+    return np.array(bmp, copy=False)
 
 
 # ─── Buffer utilities ─────────────────────────────────────────────────────────
@@ -278,7 +277,7 @@ def main():
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--res", type=int, default=RESOLUTION)
-    parser.add_argument("--out", default="result.png")
+    parser.add_argument("--out", default="result.exr")
     args = parser.parse_args()
 
     target = (
@@ -296,10 +295,10 @@ def main():
     learner = train(target, device)
 
     pred = learner.infer()
-    print(pred)
-    from PIL import Image
-
-    Image.fromarray((pred.clip(0, 1) * 255).astype(np.uint8)).save(args.out)
+    # Save using slangpy.Bitmap
+    bmp = spy.Bitmap(pred, spy.Bitmap.PixelFormat.rgb)
+    spy.tev.show(bmp, name="prediction")
+    bmp.write(Path(args.out))
     print(f"Result saved → {args.out}")
 
 
