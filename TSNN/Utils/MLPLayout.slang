@@ -1,5 +1,7 @@
-import Util;
+import Math;
 
+
+// TODO: Move to CPU
 struct MLPLayout<let DEPTH : uint>
 {
     uint inputFeatures;

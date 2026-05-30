@@ -18,6 +18,8 @@ vector<T, FEATURES> encodeHashGridSingle<T : __BuiltinFloatingPointType, uint FE
 {
     static_assert(FEATURES <= 4, "encodeHashGridSingle only supports up to 4 features due to using vector<T, N> for loading");
     float3 scaled = position * float(resolution - 1u);
+
+    // TODO: Reorder and make procedural
     let p000 = uint3(floor(scaled));
     let p100 = p000 + uint3(1, 0, 0);
     let p010 = p000 + uint3(0, 1, 0);
@@ -67,6 +69,7 @@ vector<T, FEATURES> encodeHashGridSingle<T : __BuiltinFloatingPointType, uint FE
     return result;
 }
 
+// TODO: Extract in class
 [Differentiable]
 T[LEVELS * FEATURES] encodeHashGrid<T : __BuiltinFloatingPointType, uint LEVELS, uint FEATURES>(FeatureBuffer features, no_diff float3 position, no_diff uint hashTableSize, no_diff float baseResolution, no_diff float scale)
 {

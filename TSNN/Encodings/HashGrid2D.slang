@@ -42,6 +42,8 @@ vector<T, FEATURES> encodeHashGridSingle<T : __BuiltinFloatingPointType, uint FE
     return f00 + f01 + f10 + f11;
 }
 
+
+// TODO: COmbine with 3D
 [Differentiable]
 CoopVec<T, LEVELS * FEATURES> encodeHashGrid<T : __BuiltinFloatingPointType, uint LEVELS, uint FEATURES>(FeatureBuffer features, no_diff float2 uv, no_diff uint hashTableSize, no_diff float baseResolution, no_diff float scale)
 {
