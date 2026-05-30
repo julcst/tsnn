@@ -18,6 +18,5 @@ void inferMain(uint3 tid: SV_DispatchThreadID, uniform uint2 frameDim)
     float2 uv = (float2(pixel) + 0.5f) / float2(frameDim);
     let predVec = forward(gEncodingParams, gParams, uv);
     let pred = VectorFromCoopVec(predVec);
-    // let pred = float3(1.0f, 0.0f, 0.0f);
     gOutput[pixel] = float4(pred, 1.0f);
 }

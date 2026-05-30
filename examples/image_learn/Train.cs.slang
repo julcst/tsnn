@@ -7,33 +7,34 @@ import TSNN.Encodings.FeatureBuffer;
 import TSNN.LinearOps;
 import MLP;
 
-Texture2D<float4>    gTarget;
-ByteAddressBuffer    gParams;
-RWByteAddressBuffer  gParamGrads;
-ByteAddressBuffer    gEncodingParams;
-RWByteAddressBuffer  gEncodingParamGrads;
+Texture2D<float4> gTarget;
+ByteAddressBuffer gParams;
+RWByteAddressBuffer gParamGrads;
+ByteAddressBuffer gEncodingParams;
+RWByteAddressBuffer gEncodingParamGrads;
 
 cbuffer CB
 {
     uint2 gFrameDim;
-    uint  gBatchSize;
-    uint  gCurrentStep;
-    uint  gFrameIndex;
+    uint gBatchSize;
+    uint gCurrentStep;
+    uint gFrameIndex;
 }
 
 // PCG hash for per-invocation random pixel selection
 uint pcg(uint v)
 {
     uint state = v * 747796405u + 2891336453u;
-    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
 
 [numthreads(64, 1, 1)]
-void trainMain(uint3 tid : SV_DispatchThreadID)
+void trainMain(uint3 tid: SV_DispatchThreadID)
 {
     uint sampleIndex = tid.x;
-    if (sampleIndex >= gBatchSize) return;
+    if (sampleIndex >= gBatchSize)
+        return;
 
     // Deterministic-but-varied random pixel per sample
     uint seed = pcg(sampleIndex ^ (gFrameIndex * 1664525u) ^ (gCurrentStep * 1013904223u));
@@ -48,13 +49,11 @@ void trainMain(uint3 tid : SV_DispatchThreadID)
     let scale = CoopVec<half, kOutputSize>(half(1.0f / float(max(1u, gBatchSize))));
     let outputGrad = RelativeL2Luminance<half>::deriv(targetVec, pred, scale);
 
-    var encBuf   = FeatureBuffer(gEncodingParams);
+    var encBuf = FeatureBuffer(gEncodingParams);
     var encGrads = FeatureBufferGrad(gEncodingParamGrads);
-    var wBuf     = MatrixBiasBuffer(gParams);
-    var wGrads   = MatrixBiasBufferGrad(gParamGrads);
+    var wBuf = MatrixBiasBuffer(gParams);
+    var wGrads = MatrixBiasBufferGrad(gParamGrads);
 
-    bwd_diff(forward)(
-        DifferentialPtrPair<FeatureBuffer>(encBuf, encGrads),
-        DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads),
-        uv, outputGrad);
+    bwd_diff(forward)(DifferentialPtrPair<FeatureBuffer>(encBuf, encGrads),
+                      DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), uv, outputGrad);
 }

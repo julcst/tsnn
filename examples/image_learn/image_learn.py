@@ -10,7 +10,7 @@ import slangpy as spy
 import numpy as np
 from tqdm import trange
 
-# ─── Layout constants (must match Config.slang) ───────────────────────────────
+# ─── Layout constants (must match MLP.slang) ───────────────────────────────
 
 HASH_LEVELS = 16
 HASH_FEATURES = 2
@@ -37,7 +37,7 @@ DISPLAY_EVERY = 200
 RESOLUTION = 512
 
 
-# ─── Parameter-count helper (mirrors Config.slang::getParamCount) ─────────────
+# ─── Parameter-count helper (mirrors MLP.slang::getParamCount) ─────────────
 
 
 def _align4(x: int) -> int:
@@ -191,7 +191,14 @@ class ImageLearner:
             },
         )
 
+    def zero_gradients(self):
+        encoder = self.device.create_command_encoder()
+        encoder.clear_buffer(self.param_grads)
+        encoder.clear_buffer(self.enc_grads)
+        self.device.submit_command_buffer(encoder.finish())
+
     def train_step(self, step: int):
+        self.zero_gradients()
         self.train_kernel.dispatch(
             thread_count=[BATCH_SIZE, 1, 1],
             vars={
@@ -250,14 +257,14 @@ class ImageLearner:
 # ─── Training loop ────────────────────────────────────────────────────────────
 
 
-def train(target: np.ndarray, device):
+def train(target: np.ndarray, device, steps: int, lr: float):
     learner = ImageLearner(device, target)
     print(f"Parameters: {PARAM_COUNT:,} (MLP) + {ENC_PARAM_COUNT:,} (hash grid)")
-    print(f"Training for {STEPS} steps, batch size {BATCH_SIZE}")
+    print(f"Training for {steps} steps, batch size {BATCH_SIZE}")
 
-    for step in (t := trange(1, STEPS + 1)):
+    for step in (t := trange(1, steps + 1)):
         learner.train_step(step)
-        learner.optimize_step(step, LR)
+        learner.optimize_step(step, lr)
 
         if step % DISPLAY_EVERY == 0 or step == 1:
             pred = learner.infer()
@@ -292,7 +299,7 @@ def main():
             Path(__file__).parent.parent.parent.absolute() / "TSNN",
         ]
     )
-    learner = train(target, device)
+    learner = train(target, device, args.steps, args.lr)
 
     pred = learner.infer()
     # Save using slangpy.Bitmap
