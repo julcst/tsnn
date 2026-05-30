@@ -1,33 +1,14 @@
-#!/usr/bin/env uv run -S
+#!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["slangpy", "pillow", "numpy", "matplotlib"]
+# dependencies = ["slangpy", "pillow", "numpy", "matplotlib", "tqdm"]
 # ///
-
-"""
-TSNN image-learning example (SlangPy)
-Trains a hash-grid MLP (16 levels x2 features, 4 hidden layers of 64) to
-reproduce a target image using the same three-kernel loop as the Falcor
-SlangMLP render pass — but driven entirely from Python via SlangPy.
-
-Three kernels (matching the Falcor pass pattern):
-  1. Train    — forward + backward, accumulates gradients
-  2. Optimize — Adam step, clears gradients
-  3. Infer    — full-image forward pass for evaluation / export
-
-Dependencies:
-    pip install slangpy torch pillow numpy matplotlib
-
-Usage:
-    python image_learn.py --image path/to/image.png
-    python image_learn.py              # procedural colour-wheel target
-"""
 
 import argparse
 import math
-import time
 from pathlib import Path
 import slangpy as spy
 import numpy as np
+from tqdm import trange
 
 # ─── Layout constants (must match Config.slang) ───────────────────────────────
 
@@ -140,10 +121,6 @@ def upload_texture(device, data: np.ndarray) -> spy.Texture:
     return tex
 
 
-def download_texture(tex: spy.Texture, H: int, W: int) -> np.ndarray:
-    return tex.to_numpy()[:H, :W, :3]
-
-
 # ─── Kernel helpers ───────────────────────────────────────────────────────────
 
 
@@ -154,6 +131,7 @@ class ImageLearner:
 
         # Load and upload target image
         self.target_tex = upload_texture(device, target)
+        # spy.tev.show(self.target_tex, name="target")
 
         # GPU buffers
         self.params = create_buffer(device, PARAM_BYTES, is_rw=True)
@@ -165,82 +143,106 @@ class ImageLearner:
         self.enc_moments1 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
         self.enc_moments2 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
         self.output_tex = create_texture(device, self.W, self.H)
+        # spy.tev.show(self.output_tex, name="output")
 
-        # Load shaders
-        shader_dir = Path(__file__).parent
-        self.train_mod = spy.Module.load_from_file(
-            device, str(shader_dir / "Train.cs.slang")
+        # Load compute kernels
+        self.reset_kernel = device.create_compute_kernel(
+            device.load_program(
+                module_name="Optimize.cs.slang",
+                entry_point_names=["resetMain"],
+            )
         )
-        self.optimize_mod = spy.Module.load_from_file(
-            device, str(shader_dir / "Optimize.cs.slang")
+        self.train_kernel = device.create_compute_kernel(
+            device.load_program(
+                module_name="Train.cs.slang",
+                entry_point_names=["trainMain"],
+            )
         )
-        self.infer_mod = spy.Module.load_from_file(
-            device, str(shader_dir / "Infer.cs.slang")
+        self.optimize_kernel = device.create_compute_kernel(
+            device.load_program(
+                module_name="Optimize.cs.slang",
+                entry_point_names=["optimizeMain"],
+            )
+        )
+        self.infer_kernel = device.create_compute_kernel(
+            device.load_program(
+                module_name="Infer.cs.slang",
+                entry_point_names=["inferMain"],
+            )
         )
 
         # Reset parameters
         dispatch_count = 256 * 8
-        self.optimize_mod.resetMain.dispatch(
+        self.reset_kernel.dispatch(
             thread_count=[dispatch_count, 1, 1],
-            gParams=self.params,
-            gParamGrads=self.param_grads,
-            gMoments1=self.moments1,
-            gMoments2=self.moments2,
-            gEncodingParams=self.enc_params,
-            gEncodingParamGrads=self.enc_grads,
-            gEncodingMoments1=self.enc_moments1,
-            gEncodingMoments2=self.enc_moments2,
-            CB={
-                "gLearningRate": LR,
-                "gCurrentStep": 1.0,
-                "gDispatchThreadCount": dispatch_count,
+            vars={
+                "gParams": self.params,
+                "gParamGrads": self.param_grads,
+                "gMoments1": self.moments1,
+                "gMoments2": self.moments2,
+                "gEncodingParams": self.enc_params,
+                "gEncodingParamGrads": self.enc_grads,
+                "gEncodingMoments1": self.enc_moments1,
+                "gEncodingMoments2": self.enc_moments2,
+                "CB": {
+                    "gLearningRate": LR,
+                    "gCurrentStep": 1.0,
+                    "gDispatchThreadCount": dispatch_count,
+                },
             },
         )
 
     def train_step(self, step: int):
-        self.train_mod.trainMain.dispatch(
+        self.train_kernel.dispatch(
             thread_count=[BATCH_SIZE, 1, 1],
-            gTarget=self.target_tex,
-            gParams=self.params,
-            gParamGrads=self.param_grads,
-            gEncodingParams=self.enc_params,
-            gEncodingParamGrads=self.enc_grads,
-            CB={
-                "gFrameDim": [self.W, self.H],
-                "gBatchSize": BATCH_SIZE,
-                "gCurrentStep": step,
-                "gFrameIndex": step,
+            vars={
+                "gTarget": self.target_tex,
+                "gParams": self.params,
+                "gParamGrads": self.param_grads,
+                "gEncodingParams": self.enc_params,
+                "gEncodingParamGrads": self.enc_grads,
+                "CB": {
+                    "gFrameDim": [self.W, self.H],
+                    "gBatchSize": BATCH_SIZE,
+                    "gCurrentStep": step,
+                    "gFrameIndex": step,
+                },
             },
         )
 
     def optimize_step(self, step: int, lr: float):
         dispatch_count = 256 * 8
-        self.optimize_mod.optimizeMain.dispatch(
+        self.optimize_kernel.dispatch(
             thread_count=[dispatch_count, 1, 1],
-            gParams=self.params,
-            gParamGrads=self.param_grads,
-            gMoments1=self.moments1,
-            gMoments2=self.moments2,
-            gEncodingParams=self.enc_params,
-            gEncodingParamGrads=self.enc_grads,
-            gEncodingMoments1=self.enc_moments1,
-            gEncodingMoments2=self.enc_moments2,
-            CB={
-                "gLearningRate": lr,
-                "gCurrentStep": float(step),
-                "gDispatchThreadCount": dispatch_count,
+            vars={
+                "gParams": self.params,
+                "gParamGrads": self.param_grads,
+                "gMoments1": self.moments1,
+                "gMoments2": self.moments2,
+                "gEncodingParams": self.enc_params,
+                "gEncodingParamGrads": self.enc_grads,
+                "gEncodingMoments1": self.enc_moments1,
+                "gEncodingMoments2": self.enc_moments2,
+                "CB": {
+                    "gLearningRate": lr,
+                    "gCurrentStep": float(step),
+                    "gDispatchThreadCount": dispatch_count,
+                },
             },
         )
 
     def infer(self) -> np.ndarray:
-        self.infer_mod.inferMain.dispatch(
-            thread_count=[(self.W + 7) // 8 * 8, (self.H + 7) // 8 * 8, 1],
-            gParams=self.params,
-            gEncodingParams=self.enc_params,
-            gOutput=self.output_tex,
-            CB={"gFrameDim": [self.W, self.H]},
+        self.infer_kernel.dispatch(
+            thread_count=[self.W, self.H, 1],
+            frameDim=[self.W, self.H],
+            vars={
+                "gOutput": self.output_tex,
+                "gParams": self.params,
+                "gEncodingParams": self.enc_params,
+            },
         )
-        return download_texture(self.output_tex, self.H, self.W)
+        # spy.tev.show(self.output_tex, name="output2")
+        return self.output_tex.to_numpy().view(np.float32)[..., :3]
 
     def mse(self, pred: np.ndarray, target: np.ndarray) -> float:
         return float(np.mean((pred - target) ** 2))
@@ -254,8 +256,7 @@ def train(target: np.ndarray, device):
     print(f"Parameters: {PARAM_COUNT:,} (MLP) + {ENC_PARAM_COUNT:,} (hash grid)")
     print(f"Training for {STEPS} steps, batch size {BATCH_SIZE}")
 
-    t0 = time.time()
-    for step in range(1, STEPS + 1):
+    for step in (t := trange(1, STEPS + 1)):
         learner.train_step(step)
         learner.optimize_step(step, LR)
 
@@ -263,8 +264,7 @@ def train(target: np.ndarray, device):
             pred = learner.infer()
             mse = learner.mse(pred, target)
             psnr = -10 * math.log10(max(mse, 1e-10))
-            elapsed = time.time() - t0
-            print(f"step {step:5d}/{STEPS} | PSNR {psnr:6.2f} dB | {elapsed:.1f}s")
+            t.set_postfix({"PSNR (dB)": f"{psnr:.2f}"})
 
     return learner
 
@@ -296,6 +296,7 @@ def main():
     learner = train(target, device)
 
     pred = learner.infer()
+    print(pred)
     from PIL import Image
 
     Image.fromarray((pred.clip(0, 1) * 255).astype(np.uint8)).save(args.out)
