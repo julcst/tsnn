@@ -2,7 +2,7 @@
 // Evaluates the MLP at every pixel and writes to a float texture.
 
 import TSNN.CoopVec;
-import MLP;
+import Network;
 
 ByteAddressBuffer gParams;
 ByteAddressBuffer gEncodingParams;

@@ -17,7 +17,7 @@ CoopVec<T, K> relu<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
     return max(v, CoopVec<T, K>(T(0.)));
 }
 
-CoopVec<T, K> leakyReLU<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> p, no_diff T a)
+CoopVec<T, K> leakyReLU<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> p, no_diff T a = T(0.01))
 {
     [ForceUnroll]
     for (int i = 0; i < K; ++i)

@@ -5,7 +5,7 @@ import TSNN.CoopVec;
 import TSNN.Losses;
 import TSNN.Encodings.FeatureBuffer;
 import TSNN.LinearOps;
-import MLP;
+import Network;
 
 Texture2D<float4> gTarget;
 ByteAddressBuffer gParams;
@@ -46,7 +46,7 @@ void trainMain(uint3 tid: SV_DispatchThreadID)
 
     let pred = forward(gEncodingParams, gParams, uv);
 
-    let scale = CoopVec<half, kOutputSize>(half(1.0f / float(max(1u, gBatchSize))));
+    let scale = CoopVec<half, 3>(half(1.0f / float(max(1u, gBatchSize))));
     let outputGrad = RelativeL2Luminance<half>::deriv(targetVec, pred, scale);
 
     var encBuf = FeatureBuffer(gEncodingParams);

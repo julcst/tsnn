@@ -3,7 +3,7 @@
 
 import TSNN.Optimizers.Adam;
 import TSNN.Utils.PCG32;
-import MLP;
+import Network;
 
 RWByteAddressBuffer gParams;
 RWByteAddressBuffer gParamGrads;
@@ -21,6 +21,7 @@ cbuffer CB
     uint gDispatchThreadCount;
 }
 
+// TODO: Move to utils
 float4 loadFloat4(RWByteAddressBuffer b, uint base)
 {
     return b.LoadAligned<float4>(base * sizeof(float));
@@ -55,7 +56,7 @@ void resetMain(uint3 tid: SV_DispatchThreadID)
 
     for (uint i = tid.x; i < kParamElementCount; i += gDispatchThreadCount)
     {
-        float scale = sqrt(2.0f / float(kHiddenSize));
+        float scale = sqrt(2.0f / float(3));
         float p = rng.nextFloat() * 2.0f - 1.0f;
         gParams.StoreAligned<half>(i * sizeof(half), half(p * scale));
         gMoments1.StoreAligned<float>(i * sizeof(float), 0.0f);
@@ -73,7 +74,7 @@ void resetMain(uint3 tid: SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void optimizeMain(uint3 tid: SV_DispatchThreadID)
 {
-    let adam = Adam(gLearningRate, kAdamBeta1, kAdamBeta2, kAdamEpsilon, gCurrentStep, kOptimizerLossScale);
+    let adam = Adam(gCurrentStep);
 
     for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
     {
