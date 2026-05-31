@@ -7,6 +7,7 @@ import TSNN.LinearOps;
 import TSNN.CoopVec;
 import TSNN.Utils.Math;
 import TSNN.Utils.MLP;
+import TSNN.Activations;
 
 static constexpr const uint kHashLevels = 16u;
 static constexpr const uint kHashFeaturesPerLevel = 2u;
@@ -25,7 +26,7 @@ CoopVec<half, 3> forward(FeatureBuffer encodingParams, MatrixBiasBuffer weights,
     let input = encodeHashGrid<half, kHashLevels, kHashFeaturesPerLevel>(
         encodingParams, uv, kHashTableSize, float(kHashBaseResolution), kHashPerLevelScale);
 
-    return kMLP.forward(weights, input);
+    return kMLP.forward<LeakyReLU>(weights, input);
 }
 
 CoopVec<half, 3> forward(ByteAddressBuffer enc, ByteAddressBuffer w, no_diff float2 uv)

@@ -8,7 +8,7 @@ interface IActivation
 
 struct ReLU : IActivation
 {
-    [TreatAsDifferentiable]
+    [Differentiable]
     CoopVec<T, N> eval<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, N> input)
     {
         return relu(input);
@@ -17,7 +17,7 @@ struct ReLU : IActivation
 
 struct LeakyReLU : IActivation
 {
-    [TreatAsDifferentiable]
+    [Differentiable]
     CoopVec<T, N> eval<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, N> input)
     {
         return leakyReLU(input);
