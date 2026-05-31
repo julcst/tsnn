@@ -1,7 +1,6 @@
 import LinearOps;
 import CoopVec;
 import Math;
-import Activations;
 
 struct MLP<
     let INPUT : uint,
@@ -35,15 +34,15 @@ struct MLP<
     }
 
     [Differentiable]
-    CoopVec<half, OUTPUT> forward<ACT : IActivation = LeakyReLU>(MatrixBiasBuffer weights, CoopVec<half, INPUT> input, ACT act = ACT())
+    CoopVec<half, OUTPUT> forward(MatrixBiasBuffer weights, CoopVec<half, INPUT> input)
     {
         var h = LinearOp<half, HIDDEN>(input, weights, offsets[0], LAYOUT, COMPONENT_TYPE);
-        h = act.eval(h);
+        h = leakyReLU(h, half(0.01f));
         [ForceUnroll]
-        for (uint l = 1u; l < DEPTH + 1u; ++l)
+        for (uint l = 1u; l < DEPTH; ++l)
         {
             h = LinearOp<half, HIDDEN>(h, weights, offsets[l], LAYOUT, COMPONENT_TYPE);
-            h = act.eval(h);
+            h = leakyReLU(h, half(0.01f));
         }
         return LinearOp<half, OUTPUT>(h, weights, offsets[DEPTH], LAYOUT, COMPONENT_TYPE);
     }

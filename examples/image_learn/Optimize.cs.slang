@@ -56,7 +56,7 @@ void resetMain(uint3 tid: SV_DispatchThreadID)
 
     for (uint i = tid.x; i < kParamElementCount; i += gDispatchThreadCount)
     {
-        float scale = sqrt(2.0f / float(3));
+        float scale = sqrt(2.0f / float(64));
         float p = rng.nextFloat() * 2.0f - 1.0f;
         gParams.StoreAligned<half>(i * sizeof(half), half(p * scale));
         gMoments1.StoreAligned<float>(i * sizeof(float), 0.0f);
@@ -74,7 +74,8 @@ void resetMain(uint3 tid: SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void optimizeMain(uint3 tid: SV_DispatchThreadID)
 {
-    let adam = Adam(gCurrentStep);
+    let adamConfig = AdamConfig(gLearningRate);
+    let adam = Adam(gCurrentStep, adamConfig);
 
     for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
     {
