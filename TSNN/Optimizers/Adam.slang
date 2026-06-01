@@ -14,7 +14,6 @@ struct Adam
     // Constant parameters derived from the above
     float invSqrtBiasCorrection2;
     float stepSize;
-    float invLossScale;
 
     __init(float t, AdamConfig config = AdamConfig())
     {
