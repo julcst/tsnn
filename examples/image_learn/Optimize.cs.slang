@@ -3,6 +3,8 @@
 
 import TSNN.Optimizers.Adam;
 import TSNN.Utils.PCG32;
+import TSNN.Utils.RWBuffer;
+import TSNN.Utils.Math;
 import Network;
 
 RWByteAddressBuffer gParams;
@@ -19,34 +21,6 @@ cbuffer CB
     float gLearningRate;
     float gCurrentStep;
     uint gDispatchThreadCount;
-}
-
-// TODO: Move to utils
-float4 loadFloat4(RWByteAddressBuffer b, uint base)
-{
-    return b.LoadAligned<float4>(base * sizeof(float));
-}
-void storeFloat4(RWByteAddressBuffer b, uint base, float4 v)
-{
-    b.StoreAligned<float4>(base * sizeof(float), v);
-}
-float4 loadHalf4(RWByteAddressBuffer b, uint base)
-{
-    return float4(b.LoadAligned<half4>(base * sizeof(half)));
-}
-void storeHalf4(RWByteAddressBuffer b, uint base, float4 v)
-{
-    b.StoreAligned<half4>(base * sizeof(half), half4(v));
-}
-
-float4 sanitize4(float4 v)
-{
-    float4 r;
-    r.x = (isnan(v.x) || isinf(v.x)) ? 0.f : v.x;
-    r.y = (isnan(v.y) || isinf(v.y)) ? 0.f : v.y;
-    r.z = (isnan(v.z) || isinf(v.z)) ? 0.f : v.z;
-    r.w = (isnan(v.w) || isinf(v.w)) ? 0.f : v.w;
-    return r;
 }
 
 [numthreads(256, 1, 1)]
@@ -79,26 +53,26 @@ void optimizeMain(uint3 tid: SV_DispatchThreadID)
 
     for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
     {
-        var p = loadHalf4(gParams, base);
-        let g = sanitize4(loadHalf4(gParamGrads, base));
-        var m1 = loadFloat4(gMoments1, base);
-        var m2 = loadFloat4(gMoments2, base);
+        var p = LoadHalf4(gParams, base);
+        let g = sanitize(LoadHalf4(gParamGrads, base));
+        var m1 = LoadFloat4(gMoments1, base);
+        var m2 = LoadFloat4(gMoments2, base);
         adam.step(p, m1, m2, g);
-        storeFloat4(gMoments1, base, m1);
-        storeFloat4(gMoments2, base, m2);
-        storeHalf4(gParams, base, p);
+        StoreFloat4(gMoments1, base, m1);
+        StoreFloat4(gMoments2, base, m2);
+        StoreHalf4(gParams, base, p);
     }
 
     for (uint base = tid.x * 4u; base < kEncodingParamElementCount; base += gDispatchThreadCount * 4u)
     {
-        var p = loadHalf4(gEncodingParams, base);
-        let g = sanitize4(loadFloat4(gEncodingParamGrads, base));
-        var m1 = loadFloat4(gEncodingMoments1, base);
-        var m2 = loadFloat4(gEncodingMoments2, base);
+        var p = LoadHalf4(gEncodingParams, base);
+        let g = sanitize(LoadFloat4(gEncodingParamGrads, base));
+        var m1 = LoadFloat4(gEncodingMoments1, base);
+        var m2 = LoadFloat4(gEncodingMoments2, base);
         let updated = adam.step(p, m1, m2, g);
-        storeFloat4(gEncodingMoments1, base, m1);
-        storeFloat4(gEncodingMoments2, base, m2);
+        StoreFloat4(gEncodingMoments1, base, m1);
+        StoreFloat4(gEncodingMoments2, base, m2);
         if (updated)
-            storeHalf4(gEncodingParams, base, p);
+            StoreHalf4(gEncodingParams, base, p);
     }
 }
