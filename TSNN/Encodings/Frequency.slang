@@ -18,7 +18,7 @@ CoopVec<T, NUM_SCALES * PARAMS_COUNT * 2> encodeFrequency<
     {
         const int base = i * NUM_SCALES * 2;
         float sn, cn;
-        sincos(v[i] * 3.141592653589793238f, sn, cn);
+        sincos(v[i] * float.getPi(), sn, cn);
         arr[base + 0] = sn;
         arr[base + 1] = cn;
         [ForceUnroll]

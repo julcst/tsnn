@@ -93,6 +93,32 @@ void sigmoid_bwd<T : __BuiltinFloatingPointType, let K : int>(
 }
 
 // ─── Float array / vector ↔ CoopVec conversions ───────────────────────────────
+//
+// CoopVecToArray / CoopVecToArray_bwd:
+//   Like VectorFromCoopVec but returns float[N] instead of vector<float,N>,
+//   allowing N > 4.  The backward scatters the float-array gradient back into
+//   the CoopVec differential.
+
+[BackwardDerivative(CoopVecToArray_bwd)]
+float[N] CoopVecToArray<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, N> v)
+{
+    float arr[N];
+    [ForceUnroll]
+    for (int i = 0; i < N; i++)
+        arr[i] = v[i].toFloat();
+    return arr;
+}
+
+void CoopVecToArray_bwd<T : __BuiltinFloatingPointType, let N : int>(
+    inout DifferentialPair<CoopVec<T, N>> v,
+    float arr[N])
+{
+    CoopVec<T, N> dv;
+    [ForceUnroll]
+    for (int i = 0; i < N; i++)
+        dv[i] = T(arr[i]);
+    v = diffPair(v.p, dv);
+}
 
 [BackwardDerivative(CoopVecFromArray_bwd)]
 CoopVec<T, N> CoopVecFromArray<T : __BuiltinFloatingPointType, let N : int>(float arr[N])

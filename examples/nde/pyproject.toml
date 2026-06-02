@@ -1,0 +1,11 @@
+[project]
+name = "nde"
+version = "0.1.0"
+description = "Neural Density Estimation with RQS Normalizing Flows"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.6",
+    "slangpy>=0.42.0",
+    "tqdm>=4.67.3",
+    "Pillow>=11.0.0",
+]
