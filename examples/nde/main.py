@@ -5,13 +5,16 @@
 """
 Neural Density Estimation — main training script.
 
-Trains a 4-layer RQS normalizing flow to fit a 2-D probability
+Trains a 4-layer affine coupling normalizing flow to fit a 2-D probability
 distribution defined by a greyscale image.  During training the three
 GPU kernels mirror the image_learn pattern:
 
-  1. trainMain   – compute NLL gradients for a random mini-batch
+  1. trainMain    – compute NLL gradients for a random mini-batch
   2. optimizeMain – Adam step on the parameter buffer
   3. evalMain     – render the learned density to a texture
+
+Evaluation uses total-variation distance between the model's predicted PDF
+(from the density texture) and an analytic histogram built from training data.
 
 Usage:
   python main.py                        # default: synthetic 2-D Gaussian mixture
@@ -30,16 +33,15 @@ from tqdm import trange
 
 # ─── Architecture constants (must match Network.slang) ───────────────────────
 
-NUM_BINS       = 8
-HIDDEN         = 32
-COND_DEPTH     = 2   # hidden layers in conditioner MLP
-NUM_FLOW_LAYERS = 4
-TAIL_BOUND     = 3.0
-
-PARAMS_PER_SPLINE = 3 * NUM_BINS - 1  # 23
+HIDDEN = 64
+COND_DEPTH = 2  # hidden layers in conditioner MLP
+NUM_FLOW_LAYERS = 8
+PARAMS_PER_LAYER = 2  # [s_raw, t] per affine coupling layer
+TAIL_BOUND = 3.0
 
 
 # ─── Parameter-count mirror of Network.slang constexprs ──────────────────────
+
 
 def _align4(x: int) -> int:
     return (x + 3) & ~3
@@ -49,31 +51,34 @@ def _mlp_byte_size(input_dim: int, hidden: int, depth: int, output_dim: int) -> 
     """Byte size of one MLP block (float16 weights), mirroring MLP.slang __init."""
     byte_off = 0
     for l in range(depth + 1):
-        in_size  = input_dim if l == 0 else hidden
+        in_size = input_dim if l == 0 else hidden
         out_size = output_dim if l == depth else hidden
-        byte_off = _align4(byte_off + 2 * in_size  * out_size)  # weights (half)
-        byte_off = _align4(byte_off + 2 * out_size)              # biases  (half)
+        byte_off = _align4(byte_off + 2 * in_size * out_size)  # weights (half)
+        byte_off = _align4(byte_off + 2 * out_size)  # biases  (half)
     return byte_off
 
 
-MLP_BLOCK_BYTES   = _mlp_byte_size(1, HIDDEN, COND_DEPTH, PARAMS_PER_SPLINE)
-PARAM_BYTE_COUNT  = MLP_BLOCK_BYTES * NUM_FLOW_LAYERS
-PARAM_ELEM_COUNT  = PARAM_BYTE_COUNT // 2          # float16 elements
-MOMENT_BYTE_COUNT = PARAM_ELEM_COUNT * 4           # float32 moments
+MLP_BLOCK_BYTES = _mlp_byte_size(1, HIDDEN, COND_DEPTH, PARAMS_PER_LAYER)
+PARAM_BYTE_COUNT = MLP_BLOCK_BYTES * NUM_FLOW_LAYERS
+PARAM_ELEM_COUNT = PARAM_BYTE_COUNT // 2  # float16 elements
+MOMENT_BYTE_COUNT = PARAM_ELEM_COUNT * 4  # float32 moments
 
 
 # ─── Training hyper-parameters ───────────────────────────────────────────────
 
-BATCH_SIZE    = 1 << 14   # 16 384 data samples per step
-N_DATA        = 1 << 20   # pre-generated pool: 1 M samples
-STEPS         = 30_000
-LR            = 2e-5      # stable LR; higher values diverge with float16 grads
-LR_WARMUP     = 500       # linear LR warmup steps
+BATCH_SIZE = 1 << 14  # 16 384 data samples per step
+N_DATA = 1 << 20  # pre-generated pool: 1 M samples
+STEPS = 36_000
+LR = 3e-5   # float32 master makes Adam usable; >5e-5 lets weights grow into the
+            # imprecise float16-mirror range and destabilises late training
+LR_WARMUP = 500
+
 DISPLAY_EVERY = 3_000
-GRID_RES      = 256       # density evaluation grid
+GRID_RES = 256  # density evaluation grid
 
 
 # ─── 2-D data generation ─────────────────────────────────────────────────────
+
 
 def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.ndarray:
     """Sample 2-D points from a greyscale image used as an unnormalised PDF."""
@@ -81,7 +86,6 @@ def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.nda
     pdf = img / img.sum()
 
     H, W = pdf.shape
-    # Marginal over rows (y axis), then conditional over columns
     p_row = pdf.sum(axis=1)
     cdf_row = np.cumsum(p_row)
 
@@ -99,7 +103,6 @@ def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.nda
         cols[mask] = np.searchsorted(cdf_col, np.random.rand(mask.sum()))
     cols = np.clip(cols, 0, W - 1)
 
-    # Add sub-pixel jitter and map to [-bound, bound]
     jitter = np.random.rand(n, 2) - 0.5
     x = ((cols + 0.5 + jitter[:, 0]) / W) * 2.0 * bound - bound
     y = ((rows + 0.5 + jitter[:, 1]) / H) * 2.0 * bound - bound
@@ -107,11 +110,11 @@ def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.nda
 
 
 def gaussian_mixture_samples(n: int, bound: float = TAIL_BOUND) -> np.ndarray:
-    """Fallback: 5-component Gaussian mixture clamped to [-bound, bound]."""
-    centres = np.array([
-        [ 0.0,  0.0], [ 1.5,  1.5], [-1.5,  1.5],
-        [ 1.5, -1.5], [-1.5, -1.5],
-    ], dtype=np.float32)
+    """5-component Gaussian mixture clamped to (-bound, bound) — canonical NF benchmark."""
+    centres = np.array(
+        [[0.0, 0.0], [1.5, 1.5], [-1.5, 1.5], [1.5, -1.5], [-1.5, -1.5]],
+        dtype=np.float32,
+    )
     scales = np.array([0.5, 0.4, 0.4, 0.4, 0.4], dtype=np.float32)
 
     idx = np.random.randint(0, len(centres), size=n)
@@ -119,7 +122,29 @@ def gaussian_mixture_samples(n: int, bound: float = TAIL_BOUND) -> np.ndarray:
     return np.clip(pts, -bound + 1e-3, bound - 1e-3)
 
 
+def analytic_histogram(samples: np.ndarray, grid_res: int, bound: float) -> np.ndarray:
+    """2-D histogram of samples, normalised to sum to 1.
+    Output shape (grid_res, grid_res) with [row, col] = [y-bin, x-bin].
+    """
+    edges = np.linspace(-bound, bound, grid_res + 1)
+    hist, _, _ = np.histogram2d(
+        samples[:, 0],
+        samples[:, 1],
+        bins=[edges, edges],
+    )
+    hist = hist.T.astype(np.float64)  # transpose → [y-bin, x-bin]
+    return (hist / hist.sum()).astype(np.float32)
+
+
 # ─── Buffer helpers ───────────────────────────────────────────────────────────
+
+
+def save_density_png(arr: np.ndarray, path: str):
+    """Save a 2-D density array as an 8-bit greyscale PNG (row 0 = y min)."""
+    normed = arr / max(float(arr.max()), 1e-10)
+    img = (np.clip(normed, 0.0, 1.0) * 255).astype(np.uint8)
+    Image.fromarray(img[::-1]).save(path)  # flip rows so y increases upward
+
 
 def make_buf(device, size_bytes: int, rw: bool = False) -> spy.Buffer:
     usage = spy.BufferUsage.shader_resource
@@ -130,13 +155,15 @@ def make_buf(device, size_bytes: int, rw: bool = False) -> spy.Buffer:
 
 def make_tex(device, w: int, h: int) -> spy.Texture:
     return device.create_texture(
-        width=w, height=h,
+        width=w,
+        height=h,
         format=spy.Format.rgba32_float,
         usage=spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_access,
     )
 
 
 # ─── Main learner class ───────────────────────────────────────────────────────
+
 
 class NDELearner:
     def __init__(self, device, samples: np.ndarray):
@@ -151,28 +178,15 @@ class NDELearner:
             data=samples_f32,
         )
 
-        # Held-out test set (4096 samples) for NLL evaluation
-        n_test = 4096
-        np.random.seed(1)
-        if hasattr(samples, 'shape') and len(samples) >= n_test * 2:
-            test_idx = np.random.choice(len(samples), n_test, replace=False)
-            test_pts = samples[test_idx].astype(np.float32)
-        else:
-            test_pts = samples[:n_test].astype(np.float32)
-        self.n_test = n_test
-        test_flat = test_pts.flatten()
-        self.test_buf = device.create_buffer(
-            size=int(test_flat.nbytes),
-            usage=spy.BufferUsage.shader_resource,
-            data=test_flat,
-        )
-        self.logprob_buf = make_buf(device, n_test * 4, rw=True)
+        # Analytic histogram for PDF distance evaluation
+        self.analytic_hist = analytic_histogram(samples, GRID_RES, TAIL_BOUND)
 
-        # Parameter + gradient + moment buffers (all float16 params)
-        self.params      = make_buf(device, PARAM_BYTE_COUNT,  rw=True)
-        self.param_grads = make_buf(device, PARAM_BYTE_COUNT,  rw=True)
-        self.moments1    = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
-        self.moments2    = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
+        # Parameter buffers: float16 mirror (GPU compute) + float32 master (Adam)
+        self.params = make_buf(device, PARAM_BYTE_COUNT, rw=True)
+        self.params_master = make_buf(device, MOMENT_BYTE_COUNT, rw=True)  # float32
+        self.param_grads = make_buf(device, PARAM_BYTE_COUNT, rw=True)
+        self.moments1 = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
+        self.moments2 = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
 
         # Output texture for density visualisation
         self.density_tex = make_tex(device, GRID_RES, GRID_RES)
@@ -188,12 +202,11 @@ class NDELearner:
                 device.load_program(module_name=module, entry_point_names=[entry])
             )
 
-        self.reset_k    = load("Optimize.cs.slang", "resetMain")
-        self.train_k    = load("Train.cs.slang",    "trainMain")
+        self.reset_k = load("Optimize.cs.slang", "resetMain")
+        self.train_k = load("Train.cs.slang", "trainMain")
         self.optimize_k = load("Optimize.cs.slang", "optimizeMain")
-        self.eval_k     = load("Infer.cs.slang",    "evalMain")
-        self.nll_k      = load("Infer.cs.slang",    "evalNLLMain")
-        self.sample_k   = load("Infer.cs.slang",    "sampleMain")
+        self.eval_k = load("Infer.cs.slang", "evalMain")
+        self.sample_k = load("Infer.cs.slang", "sampleMain")
 
         self._reset()
 
@@ -202,11 +215,16 @@ class NDELearner:
         self.reset_k.dispatch(
             thread_count=[n, 1, 1],
             vars={
-                "gParams":    self.params,
+                "gParams": self.params,
+                "gParamsMaster": self.params_master,
                 "gParamGrads": self.param_grads,
-                "gMoments1":  self.moments1,
-                "gMoments2":  self.moments2,
-                "CB": {"gLearningRate": LR, "gCurrentStep": 1.0, "gDispatchThreadCount": n},
+                "gMoments1": self.moments1,
+                "gMoments2": self.moments2,
+                "CB": {
+                    "gLearningRate": LR,
+                    "gCurrentStep": 1.0,
+                    "gDispatchThreadCount": n,
+                },
             },
         )
 
@@ -220,12 +238,12 @@ class NDELearner:
         self.train_k.dispatch(
             thread_count=[BATCH_SIZE, 1, 1],
             vars={
-                "gSamples":    self.data_buf,
-                "gParams":     self.params,
+                "gSamples": self.data_buf,
+                "gParams": self.params,
                 "gParamGrads": self.param_grads,
                 "CB": {
-                    "gNumSamples":  self.n_data,
-                    "gBatchSize":   BATCH_SIZE,
+                    "gNumSamples": self.n_data,
+                    "gBatchSize": BATCH_SIZE,
                     "gCurrentStep": step,
                 },
             },
@@ -236,11 +254,16 @@ class NDELearner:
         self.optimize_k.dispatch(
             thread_count=[n, 1, 1],
             vars={
-                "gParams":     self.params,
+                "gParams": self.params,
+                "gParamsMaster": self.params_master,
                 "gParamGrads": self.param_grads,
-                "gMoments1":   self.moments1,
-                "gMoments2":   self.moments2,
-                "CB": {"gLearningRate": lr, "gCurrentStep": float(step), "gDispatchThreadCount": n},
+                "gMoments1": self.moments1,
+                "gMoments2": self.moments2,
+                "CB": {
+                    "gLearningRate": lr,
+                    "gCurrentStep": float(step),
+                    "gDispatchThreadCount": n,
+                },
             },
         )
 
@@ -254,20 +277,22 @@ class NDELearner:
         arr = self.density_tex.to_numpy().view(np.float32)[..., 0]  # R channel
         return arr
 
-    def eval_nll(self) -> float:
-        """Compute mean NLL on the held-out test set."""
-        self.nll_k.dispatch(
-            thread_count=[self.n_test, 1, 1],
-            vars={
-                "gParams":      self.params,
-                "gTestSamples": self.test_buf,
-                "gLogProbsOut": self.logprob_buf,
-                "NLLCB":        {"gNLLCount": self.n_test},
-            },
-        )
-        logps = np.frombuffer(self.logprob_buf.to_numpy(), dtype=np.float32).copy()
-        logps = logps[np.isfinite(logps)]
-        return float(-np.mean(logps)) if len(logps) > 0 else float("nan")
+    def compute_jsd(self, density: np.ndarray) -> float:
+        """Jensen-Shannon divergence in [0, log 2] between model PDF and analytic histogram.
+
+        JSD(p, q) = 0.5*KL(p||m) + 0.5*KL(q||m), m = (p+q)/2.
+        Symmetric, bounded, and well-defined even when one distribution has zero bins.
+        """
+        p = self.analytic_hist.astype(np.float64)
+        q = density.astype(np.float64)
+        q /= max(q.sum(), 1e-10)
+        m = 0.5 * (p + q)
+
+        def kl(a, b):
+            mask = a > 0
+            return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+
+        return 0.5 * (kl(p, m) + kl(q, m))
 
     def generate_samples(self, n: int) -> np.ndarray:
         """Generate n samples from the learned distribution."""
@@ -275,9 +300,9 @@ class NDELearner:
         self.sample_k.dispatch(
             thread_count=[n, 1, 1],
             vars={
-                "gParams":    self.params,
+                "gParams": self.params,
                 "gSampleOut": out_buf,
-                "SampleCB":   {"gNumSamples": n, "gSeed": 42},
+                "SampleCB": {"gNumSamples": n, "gSeed": 42},
             },
         )
         raw = np.frombuffer(out_buf.to_numpy(), dtype=np.float32)
@@ -286,11 +311,14 @@ class NDELearner:
 
 # ─── Training loop ────────────────────────────────────────────────────────────
 
+
 def train(learner: NDELearner, steps: int, lr: float):
-    print(f"Parameters: {PARAM_ELEM_COUNT:,} float16 ({PARAM_BYTE_COUNT / 1024:.1f} KB)")
+    print(
+        f"Parameters: {PARAM_ELEM_COUNT:,} float16 ({PARAM_BYTE_COUNT / 1024:.1f} KB)"
+    )
     print(f"Training {steps} steps, batch {BATCH_SIZE}, lr={lr}")
 
-    best_nll = float("inf")
+    best_jsd = float("inf")
     for step in (bar := trange(1, steps + 1)):
         # Linear warmup then cosine decay
         if step <= LR_WARMUP:
@@ -303,23 +331,28 @@ def train(learner: NDELearner, steps: int, lr: float):
         learner.optimize_step(step, current_lr)
 
         if step % DISPLAY_EVERY == 0 or step == 1:
-            nll = learner.eval_nll()
-            best_nll = min(best_nll, nll)
-            bar.set_postfix({"NLL": f"{nll:.3f}", "best": f"{best_nll:.3f}"})
+            density = learner.eval_density()
+            jsd = learner.compute_jsd(density)
+            best_jsd = min(best_jsd, jsd)
+            bar.set_postfix({"JSD": f"{jsd:.4f}", "best": f"{best_jsd:.4f}"})
+            save_density_png(density, f"model_step{step:06d}.png")
 
     return learner
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image",  default=None, help="Greyscale image to fit as PDF")
-    parser.add_argument("--steps",  type=int,   default=STEPS)
-    parser.add_argument("--lr",     type=float, default=LR)
-    parser.add_argument("--n-data", type=int,   default=N_DATA)
-    parser.add_argument("--out",    default="density.exr", help="Output density image")
-    parser.add_argument("--out-samples", default=None, help="Save generated samples (.npy)")
+    parser.add_argument("--image", default=None, help="Greyscale image to fit as PDF")
+    parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--n-data", type=int, default=N_DATA)
+    parser.add_argument("--out", default="density.exr", help="Output density image")
+    parser.add_argument(
+        "--out-samples", default=None, help="Save generated samples (.npy)"
+    )
     args = parser.parse_args()
 
     np.random.seed(0)
@@ -339,12 +372,13 @@ def main():
     )
 
     learner = NDELearner(device, samples)
+    save_density_png(learner.analytic_hist, "target_hist.png")
+    print("Target histogram saved → target_hist.png")
     train(learner, args.steps, args.lr)
 
     # Save density image
     density = learner.eval_density()
-    density_norm = density / max(density.max(), 1e-8)
-    rgba = np.stack([density_norm] * 3 + [np.ones_like(density_norm)], axis=-1).astype(np.float32)
+    rgba = np.stack([density] * 3 + [np.ones_like(density)], axis=-1).astype(np.float32)
     bmp = spy.Bitmap(rgba, spy.Bitmap.PixelFormat.rgba)
     bmp.write(Path(args.out))
     print(f"Density saved → {args.out}")

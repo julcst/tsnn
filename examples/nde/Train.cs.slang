@@ -44,8 +44,14 @@ void trainMain(uint3 tid : SV_DispatchThreadID)
     x.x = asfloat(gSamples.Load(dataIdx * 8u + 0u));
     x.y = asfloat(gSamples.Load(dataIdx * 8u + 4u));
 
-    // NLL loss gradient: d(-log p(x)) / d(log p(x)) = -1/N
-    float outputGrad = -1.0f / float(max(1u, gBatchSize));
+    // NLL loss gradient: d(-log p(x)) / d(log p(x)) = -1/N.
+    // We scale by a constant (kGradScale) so the per-sample contribution
+    // sits comfortably inside float16's normal range: -1/16384 ≈ 6.1e-5 is at
+    // the float16 min-normal, so grad·activation underflows to zero in the
+    // float16 gradient buffer.  Adam is scale-invariant, so this constant
+    // cancels out of the parameter update and only improves accumulation precision.
+    const float kGradScale = 128.0f;
+    float outputGrad = -kGradScale / float(max(1u, gBatchSize));
 
     var wBuf   = MatrixBiasBuffer(gParams);
     var wGrads = MatrixBiasBufferGrad(gParamGrads);

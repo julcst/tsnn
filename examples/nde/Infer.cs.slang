@@ -25,7 +25,7 @@ void evalMain(uint3 tid : SV_DispatchThreadID, uniform uint2 frameDim)
 
     // Map pixel centre to domain [-kTailBound, kTailBound]²
     float2 uv = (float2(pixel) + 0.5f) / float2(frameDim);
-    float2 x  = (uv * 2.0f - 1.0f) * kTailBound;
+    float2 x  = (uv * 2.0f - 1.0f) * 3.0f; // in [-1, 1]
 
     float logp  = forward(gParams, x);
     float density = exp(logp);
