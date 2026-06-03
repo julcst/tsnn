@@ -29,7 +29,7 @@
 
 import TSNN.CoopVec;
 
-static const float kRQSMinBinWidth   = 1e-2f;
+static const float kRQSMinBinWidth   = 1e-3f;
 static const float kRQSMinBinHeight  = 1e-3f;
 static const float kRQSMinDerivative = 1e-3f;
 
