@@ -1,20 +1,25 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["slangpy", "numpy", "tqdm", "Pillow"]
+# dependencies = ["slangpy", "numpy", "tqdm"]
 # ///
 """
 Neural Density Estimation — main training script.
 
-Trains a 4-layer affine coupling normalizing flow to fit a 2-D probability
-distribution defined by a greyscale image.  During training the three
-GPU kernels mirror the image_learn pattern:
+Trains an 8-layer coupling normalizing flow to fit a 2-D probability
+distribution.  The coupling transform is affine by default, or rational-
+quadratic splines (set USE_RQS below AND #define USE_RQS 1 in Network.slang).
 
+Everything lives on the normalized domain [-DOMAIN, DOMAIN]² (DOMAIN = 1); the
+data generators scale into it, so there is no per-dataset tail bound to manage.
+
+Three GPU kernels mirror the image_learn pattern:
   1. trainMain    – compute NLL gradients for a random mini-batch
-  2. optimizeMain – Adam step on the parameter buffer
+  2. optimizeMain – Adam step (float32 master weights, float16 mirror)
   3. evalMain     – render the learned density to a texture
 
-Evaluation uses total-variation distance between the model's predicted PDF
-(from the density texture) and an analytic histogram built from training data.
+Evaluation uses Jensen-Shannon divergence between the model's predicted PDF
+and an analytic histogram of the training data.  Density fields are written as
+float .exr (via spy.Bitmap) for easy inspection.
 
 Usage:
   python main.py                        # default: synthetic 2-D Gaussian mixture
@@ -28,7 +33,6 @@ from pathlib import Path
 
 import numpy as np
 import slangpy as spy
-from PIL import Image
 from tqdm import trange
 
 # ─── Architecture constants (must match Network.slang) ───────────────────────
@@ -36,8 +40,13 @@ from tqdm import trange
 HIDDEN = 64
 COND_DEPTH = 2  # hidden layers in conditioner MLP
 NUM_FLOW_LAYERS = 8
-PARAMS_PER_LAYER = 2  # [s_raw, t] per affine coupling layer
-TAIL_BOUND = 3.0
+NUM_BINS = 16  # RQS bins (USE_RQS only)
+DOMAIN = 1.0  # normalized data/latent domain [-1, 1]
+
+# Must match `#define USE_RQS` in Network.slang. Affine → 2 params/layer (s,t);
+# RQS → 3K-1 packed spline params/layer.
+USE_RQS = True
+PARAMS_PER_LAYER = (3 * NUM_BINS - 1) if USE_RQS else 2
 
 
 # ─── Parameter-count mirror of Network.slang constexprs ──────────────────────
@@ -77,12 +86,13 @@ DISPLAY_EVERY = 3_000
 GRID_RES = 256  # density evaluation grid
 
 
-# ─── 2-D data generation ─────────────────────────────────────────────────────
+# ─── 2-D data generation (all outputs scaled to the normalized domain) ────────
 
 
-def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.ndarray:
+def image_to_samples(img_path: str, n: int, bound: float = DOMAIN) -> np.ndarray:
     """Sample 2-D points from a greyscale image used as an unnormalised PDF."""
-    img = np.array(Image.open(img_path).convert("L"), dtype=np.float32)
+    bmp = np.array(spy.Bitmap(str(img_path))).astype(np.float32)
+    img = bmp.mean(axis=2) if bmp.ndim == 3 else bmp  # luminance
     pdf = img / img.sum()
 
     H, W = pdf.shape
@@ -109,13 +119,13 @@ def image_to_samples(img_path: str, n: int, bound: float = TAIL_BOUND) -> np.nda
     return np.stack([x, y], axis=1).astype(np.float32)
 
 
-def gaussian_mixture_samples(n: int, bound: float = TAIL_BOUND) -> np.ndarray:
-    """5-component Gaussian mixture clamped to (-bound, bound) — canonical NF benchmark."""
-    centres = np.array(
-        [[0.0, 0.0], [1.5, 1.5], [-1.5, 1.5], [1.5, -1.5], [-1.5, -1.5]],
+def gaussian_mixture_samples(n: int, bound: float = DOMAIN) -> np.ndarray:
+    """5-component Gaussian mixture inside [-bound, bound] — canonical NF benchmark."""
+    centres = bound * np.array(
+        [[0.0, 0.0], [0.5, 0.5], [-0.5, 0.5], [0.5, -0.5], [-0.5, -0.5]],
         dtype=np.float32,
     )
-    scales = np.array([0.5, 0.4, 0.4, 0.4, 0.4], dtype=np.float32)
+    scales = bound * np.array([0.16, 0.12, 0.12, 0.12, 0.12], dtype=np.float32)
 
     idx = np.random.randint(0, len(centres), size=n)
     pts = centres[idx] + np.random.randn(n, 2).astype(np.float32) * scales[idx, None]
@@ -127,23 +137,19 @@ def analytic_histogram(samples: np.ndarray, grid_res: int, bound: float) -> np.n
     Output shape (grid_res, grid_res) with [row, col] = [y-bin, x-bin].
     """
     edges = np.linspace(-bound, bound, grid_res + 1)
-    hist, _, _ = np.histogram2d(
-        samples[:, 0],
-        samples[:, 1],
-        bins=[edges, edges],
-    )
+    hist, _, _ = np.histogram2d(samples[:, 0], samples[:, 1], bins=[edges, edges])
     hist = hist.T.astype(np.float64)  # transpose → [y-bin, x-bin]
     return (hist / hist.sum()).astype(np.float32)
 
 
-# ─── Buffer helpers ───────────────────────────────────────────────────────────
+# ─── I/O helpers ──────────────────────────────────────────────────────────────
 
 
-def save_density_png(arr: np.ndarray, path: str):
-    """Save a 2-D density array as an 8-bit greyscale PNG (row 0 = y min)."""
-    normed = arr / max(float(arr.max()), 1e-10)
-    img = (np.clip(normed, 0.0, 1.0) * 255).astype(np.uint8)
-    Image.fromarray(img[::-1]).save(path)  # flip rows so y increases upward
+def save_field(arr: np.ndarray, path) -> None:
+    """Write a 2-D float field as an RGBA float .exr (rows flipped so y is up)."""
+    a = np.ascontiguousarray(arr[::-1].astype(np.float32))
+    rgba = np.stack([a, a, a, np.ones_like(a)], axis=-1)
+    spy.Bitmap(rgba, spy.Bitmap.PixelFormat.rgba).write(Path(path))
 
 
 def make_buf(device, size_bytes: int, rw: bool = False) -> spy.Buffer:
@@ -179,7 +185,7 @@ class NDELearner:
         )
 
         # Analytic histogram for PDF distance evaluation
-        self.analytic_hist = analytic_histogram(samples, GRID_RES, TAIL_BOUND)
+        self.analytic_hist = analytic_histogram(samples, GRID_RES, DOMAIN)
 
         # Parameter buffers: float16 mirror (GPU compute) + float32 master (Adam)
         self.params = make_buf(device, PARAM_BYTE_COUNT, rw=True)
@@ -190,12 +196,6 @@ class NDELearner:
 
         # Output texture for density visualisation
         self.density_tex = make_tex(device, GRID_RES, GRID_RES)
-
-        # Load kernels
-        inc = [
-            Path(__file__).parent.absolute(),
-            Path(__file__).parent.parent.parent.absolute(),
-        ]
 
         def load(module, entry):
             return device.create_compute_kernel(
@@ -313,9 +313,8 @@ class NDELearner:
 
 
 def train(learner: NDELearner, steps: int, lr: float):
-    print(
-        f"Parameters: {PARAM_ELEM_COUNT:,} float16 ({PARAM_BYTE_COUNT / 1024:.1f} KB)"
-    )
+    flow = "RQS" if USE_RQS else "affine"
+    print(f"Flow: {flow}, {PARAM_ELEM_COUNT:,} float16 params ({PARAM_BYTE_COUNT / 1024:.1f} KB)")
     print(f"Training {steps} steps, batch {BATCH_SIZE}, lr={lr}")
 
     best_jsd = float("inf")
@@ -335,7 +334,7 @@ def train(learner: NDELearner, steps: int, lr: float):
             jsd = learner.compute_jsd(density)
             best_jsd = min(best_jsd, jsd)
             bar.set_postfix({"JSD": f"{jsd:.4f}", "best": f"{best_jsd:.4f}"})
-            save_density_png(density, f"model_step{step:06d}.png")
+            save_field(density, f"model_step{step:06d}.exr")
 
     return learner
 
@@ -349,7 +348,7 @@ def main():
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--n-data", type=int, default=N_DATA)
-    parser.add_argument("--out", default="density.exr", help="Output density image")
+    parser.add_argument("--out", default="density.exr", help="Output density .exr")
     parser.add_argument(
         "--out-samples", default=None, help="Save generated samples (.npy)"
     )
@@ -372,15 +371,12 @@ def main():
     )
 
     learner = NDELearner(device, samples)
-    save_density_png(learner.analytic_hist, "target_hist.png")
-    print("Target histogram saved → target_hist.png")
+    save_field(learner.analytic_hist, "target_hist.exr")
+    print("Target histogram saved → target_hist.exr")
     train(learner, args.steps, args.lr)
 
-    # Save density image
     density = learner.eval_density()
-    rgba = np.stack([density] * 3 + [np.ones_like(density)], axis=-1).astype(np.float32)
-    bmp = spy.Bitmap(rgba, spy.Bitmap.PixelFormat.rgba)
-    bmp.write(Path(args.out))
+    save_field(density, args.out)
     print(f"Density saved → {args.out}")
 
     if args.out_samples:

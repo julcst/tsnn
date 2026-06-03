@@ -23,9 +23,9 @@ void evalMain(uint3 tid : SV_DispatchThreadID, uniform uint2 frameDim)
     if (any(pixel >= frameDim))
         return;
 
-    // Map pixel centre to domain [-kTailBound, kTailBound]²
+    // Map pixel centre to the normalized domain [-kDomain, kDomain]²
     float2 uv = (float2(pixel) + 0.5f) / float2(frameDim);
-    float2 x  = (uv * 2.0f - 1.0f) * 3.0f; // in [-1, 1]
+    float2 x  = (uv * 2.0f - 1.0f) * kDomain;
 
     float logp  = forward(gParams, x);
     float density = exp(logp);
