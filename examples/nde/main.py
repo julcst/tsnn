@@ -377,6 +377,7 @@ def main():
     parser.add_argument(
         "--flow", choices=["affine", "rqs"], default="rqs", help="Coupling transform"
     )
+    # Note: Normal prior does not work well here because the domain is bounded and the normal distribution only has 47% of its mass inside [-1, 1]²
     parser.add_argument(
         "--prior",
         choices=["normal", "uniform"],
