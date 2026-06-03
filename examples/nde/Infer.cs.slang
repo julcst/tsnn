@@ -71,13 +71,11 @@ void sampleMain(uint3 tid : SV_DispatchThreadID)
     if (idx >= gNumSamples)
         return;
 
-    // Box-Muller transform from uniform PCG noise → bivariate Gaussian
+    // Draw a base latent from the configured prior, then run the inverse flow.
     let r    = pcg3d(uint3(gSeed, idx, 1u));
-    float u1 = (float(r.x) + 0.5f) / 4294967296.0f;
-    float u2 = (float(r.y) + 0.5f) / 4294967296.0f;
-    float mag = sqrt(-2.0f * log(max(u1, 1e-7f)));
-    float phi = 2.0f * float.getPi() * u2;
-    float2 z  = float2(mag * cos(phi), mag * sin(phi));
+    float2 u01 = float2((float(r.x) + 0.5f) / 4294967296.0f,
+                        (float(r.y) + 0.5f) / 4294967296.0f);
+    float2 z = samplePrior(u01);
 
     float2 x = sampleFlow(gParams, z);
 

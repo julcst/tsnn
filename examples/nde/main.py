@@ -6,8 +6,9 @@
 Neural Density Estimation — main training script.
 
 Trains an 8-layer coupling normalizing flow to fit a 2-D probability
-distribution.  The coupling transform is affine by default, or rational-
-quadratic splines (set USE_RQS below AND #define USE_RQS 1 in Network.slang).
+distribution.  The flow is configured at the command line (--flow / --prior /
+--rotations); those choices are passed to the Slang compiler as preprocessor
+#defines, so no shader editing is needed to try different variants.
 
 Everything lives on the normalized domain [-DOMAIN, DOMAIN]² (DOMAIN = 1); the
 data generators scale into it, so there is no per-dataset tail bound to manage.
@@ -22,9 +23,10 @@ and an analytic histogram of the training data.  Density fields are written as
 float .exr (via spy.Bitmap) for easy inspection.
 
 Usage:
-  python main.py                        # default: synthetic 2-D Gaussian mixture
-  python main.py --image galaxy.png     # fit image-as-PDF
-  python main.py --steps 10000 --lr 3e-4
+  python main.py                              # affine + normal + rotations (default)
+  python main.py --flow rqs --prior uniform   # bounded spline flow, clean sampling
+  python main.py --flow rqs --no-rotations    # spline flow, axis-aligned
+  python main.py --image galaxy.png --steps 10000 --lr 3e-4
 """
 
 import argparse
@@ -42,12 +44,6 @@ COND_DEPTH = 2  # hidden layers in conditioner MLP
 NUM_FLOW_LAYERS = 8
 NUM_BINS = 16  # RQS bins (USE_RQS only)
 DOMAIN = 1.0  # normalized data/latent domain [-1, 1]
-
-# Must match `#define USE_RQS` in Network.slang. Affine → 2 params/layer (s,t);
-# RQS → 3K-1 packed spline params/layer.
-USE_RQS = True
-PARAMS_PER_LAYER = (3 * NUM_BINS - 1) if USE_RQS else 2
-
 
 # ─── Parameter-count mirror of Network.slang constexprs ──────────────────────
 
@@ -67,10 +63,29 @@ def _mlp_byte_size(input_dim: int, hidden: int, depth: int, output_dim: int) -> 
     return byte_off
 
 
-MLP_BLOCK_BYTES = _mlp_byte_size(1, HIDDEN, COND_DEPTH, PARAMS_PER_LAYER)
-PARAM_BYTE_COUNT = MLP_BLOCK_BYTES * NUM_FLOW_LAYERS
-PARAM_ELEM_COUNT = PARAM_BYTE_COUNT // 2  # float16 elements
-MOMENT_BYTE_COUNT = PARAM_ELEM_COUNT * 4  # float32 moments
+def build_config(flow: str, prior: str, rotations: bool) -> dict:
+    """Resolve a (flow, prior, rotations) choice into Slang #defines + buffer sizes.
+
+    The #defines are passed to the Slang compiler (see main); the buffer sizes
+    mirror Network.slang's constexpr parameter layout for the chosen flow.
+    """
+    use_rqs = flow == "rqs"
+    use_uniform = prior == "uniform"
+    params_per_layer = (3 * NUM_BINS - 1) if use_rqs else 2
+    block = _mlp_byte_size(1, HIDDEN, COND_DEPTH, params_per_layer)
+    param_bytes = block * NUM_FLOW_LAYERS
+    elem = param_bytes // 2
+    return {
+        "defines": {
+            "USE_RQS": str(int(use_rqs)),
+            "USE_ROTATIONS": str(int(rotations)),
+            "USE_UNIFORM_PRIOR": str(int(use_uniform)),
+        },
+        "param_bytes": param_bytes,
+        "moment_bytes": elem * 4,  # float32 master + 2 Adam moments share this size
+        "param_elems": elem,
+        "label": f"{flow} + {prior}" + (" + rotations" if rotations else ""),
+    }
 
 
 # ─── Training hyper-parameters ───────────────────────────────────────────────
@@ -78,8 +93,8 @@ MOMENT_BYTE_COUNT = PARAM_ELEM_COUNT * 4  # float32 moments
 BATCH_SIZE = 1 << 14  # 16 384 data samples per step
 N_DATA = 1 << 20  # pre-generated pool: 1 M samples
 STEPS = 36_000
-LR = 3e-5   # float32 master makes Adam usable; >5e-5 lets weights grow into the
-            # imprecise float16-mirror range and destabilises late training
+LR = 3e-5  # float32 master makes Adam usable; >5e-5 lets weights grow into the
+# imprecise float16-mirror range and destabilises late training
 LR_WARMUP = 500
 
 DISPLAY_EVERY = 3_000
@@ -172,8 +187,9 @@ def make_tex(device, w: int, h: int) -> spy.Texture:
 
 
 class NDELearner:
-    def __init__(self, device, samples: np.ndarray):
+    def __init__(self, device, samples: np.ndarray, cfg: dict):
         self.device = device
+        self.cfg = cfg
         self.n_data = len(samples)
 
         # Upload training samples (float32 x,y pairs)
@@ -188,11 +204,13 @@ class NDELearner:
         self.analytic_hist = analytic_histogram(samples, GRID_RES, DOMAIN)
 
         # Parameter buffers: float16 mirror (GPU compute) + float32 master (Adam)
-        self.params = make_buf(device, PARAM_BYTE_COUNT, rw=True)
-        self.params_master = make_buf(device, MOMENT_BYTE_COUNT, rw=True)  # float32
-        self.param_grads = make_buf(device, PARAM_BYTE_COUNT, rw=True)
-        self.moments1 = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
-        self.moments2 = make_buf(device, MOMENT_BYTE_COUNT, rw=True)
+        param_bytes = cfg["param_bytes"]
+        moment_bytes = cfg["moment_bytes"]
+        self.params = make_buf(device, param_bytes, rw=True)
+        self.params_master = make_buf(device, moment_bytes, rw=True)  # float32
+        self.param_grads = make_buf(device, param_bytes, rw=True)
+        self.moments1 = make_buf(device, moment_bytes, rw=True)
+        self.moments2 = make_buf(device, moment_bytes, rw=True)
 
         # Output texture for density visualisation
         self.density_tex = make_tex(device, GRID_RES, GRID_RES)
@@ -313,8 +331,11 @@ class NDELearner:
 
 
 def train(learner: NDELearner, steps: int, lr: float):
-    flow = "RQS" if USE_RQS else "affine"
-    print(f"Flow: {flow}, {PARAM_ELEM_COUNT:,} float16 params ({PARAM_BYTE_COUNT / 1024:.1f} KB)")
+    cfg = learner.cfg
+    print(
+        f"Flow: {cfg['label']}, {cfg['param_elems']:,} float16 params "
+        f"({cfg['param_bytes'] / 1024:.1f} KB)"
+    )
     print(f"Training {steps} steps, batch {BATCH_SIZE}, lr={lr}")
 
     best_jsd = float("inf")
@@ -352,7 +373,30 @@ def main():
     parser.add_argument(
         "--out-samples", default=None, help="Save generated samples (.npy)"
     )
+    # Flow configuration — compiled into the shaders via Slang #defines.
+    parser.add_argument(
+        "--flow", choices=["affine", "rqs"], default="rqs", help="Coupling transform"
+    )
+    parser.add_argument(
+        "--prior",
+        choices=["normal", "uniform"],
+        default="normal",
+        help="Base distribution",
+    )
+    parser.add_argument(
+        "--rotations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Interleave Rotation2D mixing layers between coupling blocks",
+    )
     args = parser.parse_args()
+
+    rotations = args.rotations
+    if args.prior == "uniform" and rotations:
+        print(
+            "note: rotations push latents outside the uniform support and can lead to artifacts with uniform prior"
+        )
+    cfg = build_config(args.flow, args.prior, rotations)
 
     np.random.seed(0)
     if args.image:
@@ -362,15 +406,24 @@ def main():
         print(f"Using 5-component Gaussian mixture ({args.n_data:,} samples)")
         samples = gaussian_mixture_samples(args.n_data)
 
-    device = spy.create_device(
-        include_paths=[
-            Path(__file__).parent.absolute(),
-            Path(__file__).parent.parent.parent.absolute(),
-            Path(__file__).parent.parent.parent.absolute() / "TSNN",
-        ]
+    # Use the low-level device so we can pass the flow #defines straight to the
+    # Slang compiler (these reach the imported Network module, unlike per-program
+    # additional_source).  Must add slangpy.SHADER_PATH to the include paths.
+    here = Path(__file__).parent.absolute()
+    compiler_options = spy.SlangCompilerOptions(
+        {
+            "include_paths": [
+                here,
+                here.parent.parent,
+                here.parent.parent / "TSNN",
+                spy.SHADER_PATH,
+            ],
+            "defines": cfg["defines"],
+        }
     )
+    device = spy.Device(compiler_options=compiler_options)
 
-    learner = NDELearner(device, samples)
+    learner = NDELearner(device, samples, cfg)
     save_field(learner.analytic_hist, "target_hist.exr")
     print("Target histogram saved → target_hist.exr")
     train(learner, args.steps, args.lr)
