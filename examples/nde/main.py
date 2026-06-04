@@ -30,7 +30,6 @@ Usage:
 """
 
 import argparse
-import math
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +43,23 @@ COND_DEPTH = 2  # hidden layers in conditioner MLP
 NUM_FLOW_LAYERS = 8
 NUM_BINS = 16  # RQS bins (USE_RQS only)
 DOMAIN = 1.0  # normalized data/latent domain [-1, 1]
+
+# Conditioner-MLP activation → ACTIVATION #define in Network.slang.
+ACTIVATIONS = {
+    "relu": 0,
+    "leakyrelu": 1,
+    "swish": 2,
+    "silu": 2,
+    "gelu": 3,
+    "elu": 4,
+    "tanh": 5,
+    "mish": 6,
+}
+
+# Stability / mixed-precision knobs (see Train.cs / Optimize.cs).
+LOSS_SCALE = 128.0  # gradient pre-scale to keep float16 accumulation off the floor
+GRAD_CLIP = 1.0  # per-element gradient clip, in TRUE (unscaled) units
+WEIGHT_DECAY = 1e-2  # AdamW decoupled weight decay (ignored by Adam)
 
 # ─── Parameter-count mirror of Network.slang constexprs ──────────────────────
 
@@ -63,8 +79,16 @@ def _mlp_byte_size(input_dim: int, hidden: int, depth: int, output_dim: int) -> 
     return byte_off
 
 
-def build_config(flow: str, prior: str, rotations: bool) -> dict:
-    """Resolve a (flow, prior, rotations) choice into Slang #defines + buffer sizes.
+def build_config(
+    flow: str,
+    prior: str,
+    rotations: bool,
+    activation: str = "leakyrelu",
+    optimizer: str = "adam",
+    debug: bool = False,
+) -> dict:
+    """Resolve a flow/prior/rotation/activation/optimizer choice into Slang
+    #defines + buffer sizes.
 
     The #defines are passed to the Slang compiler (see main); the buffer sizes
     mirror Network.slang's constexpr parameter layout for the chosen flow.
@@ -75,16 +99,25 @@ def build_config(flow: str, prior: str, rotations: bool) -> dict:
     block = _mlp_byte_size(1, HIDDEN, COND_DEPTH, params_per_layer)
     param_bytes = block * NUM_FLOW_LAYERS
     elem = param_bytes // 2
+    opt_label = "adamw" if optimizer == "adamw" else "adam"
     return {
         "defines": {
             "USE_RQS": str(int(use_rqs)),
             "USE_ROTATIONS": str(int(rotations)),
             "USE_UNIFORM_PRIOR": str(int(use_uniform)),
+            "ACTIVATION": str(ACTIVATIONS[activation]),
+            "USE_ADAMW": str(int(optimizer == "adamw")),
+            "DEBUG_COUNTERS": str(int(debug)),
         },
+        "debug": debug,
         "param_bytes": param_bytes,
         "moment_bytes": elem * 4,  # float32 master + 2 Adam moments share this size
         "param_elems": elem,
-        "label": f"{flow} + {prior}" + (" + rotations" if rotations else ""),
+        "label": (
+            f"{flow} + {prior}"
+            + (" + rotations" if rotations else "")
+            + f" + {activation} + {opt_label}"
+        ),
     }
 
 
@@ -92,10 +125,11 @@ def build_config(flow: str, prior: str, rotations: bool) -> dict:
 
 BATCH_SIZE = 1 << 14  # 16 384 data samples per step
 N_DATA = 1 << 20  # pre-generated pool: 1 M samples
-STEPS = 36_000
-LR = 3e-5  # float32 master makes Adam usable; >5e-5 lets weights grow into the
-# imprecise float16-mirror range and destabilises late training
-LR_WARMUP = 500
+STEPS = 24_000
+LR = 3e-4  # constant LR (no schedule). The float32 master + loss-scale-corrected
+# clip make this stable for the whole run; lr up to 1e-3 also converges without
+# late-stage divergence. rqs+uniform reaches JSD≈0.0067 (near the noise floor) by
+# ~24k steps at this LR.
 
 DISPLAY_EVERY = 3_000
 GRID_RES = 256  # density evaluation grid
@@ -188,10 +222,22 @@ def make_tex(device, w: int, h: int) -> spy.Texture:
 
 
 class NDELearner:
-    def __init__(self, device, samples: np.ndarray, cfg: dict):
+    def __init__(
+        self,
+        device,
+        samples: np.ndarray,
+        cfg: dict,
+        loss_scale: float = LOSS_SCALE,
+        grad_clip: float = GRAD_CLIP,
+        weight_decay: float = WEIGHT_DECAY,
+    ):
         self.device = device
         self.cfg = cfg
         self.n_data = len(samples)
+        self.loss_scale = loss_scale
+        self.grad_clip = grad_clip
+        self.weight_decay = weight_decay
+        self.debug = cfg.get("debug", False)
 
         # Upload training samples (float32 x,y pairs)
         samples_f32 = samples.astype(np.float32).flatten()
@@ -212,6 +258,9 @@ class NDELearner:
         self.param_grads = make_buf(device, param_bytes, rw=True)
         self.moments1 = make_buf(device, moment_bytes, rw=True)
         self.moments2 = make_buf(device, moment_bytes, rw=True)
+
+        # Debug under/overflow tally: 4 × uint32 (only used when DEBUG_COUNTERS).
+        self.debug_counters = make_buf(device, 16, rw=True) if self.debug else None
 
         # Output texture for density visualisation
         self.density_tex = make_tex(device, GRID_RES, GRID_RES)
@@ -243,6 +292,9 @@ class NDELearner:
                     "gLearningRate": LR,
                     "gCurrentStep": 1.0,
                     "gDispatchThreadCount": n,
+                    "gLossScale": self.loss_scale,
+                    "gGradClip": self.grad_clip,
+                    "gWeightDecay": self.weight_decay,
                 },
             },
         )
@@ -264,27 +316,45 @@ class NDELearner:
                     "gNumSamples": self.n_data,
                     "gBatchSize": BATCH_SIZE,
                     "gCurrentStep": step,
+                    "gLossScale": self.loss_scale,
                 },
             },
         )
 
     def optimize_step(self, step: int, lr: float):
         n = 256 * 8
-        self.optimize_k.dispatch(
-            thread_count=[n, 1, 1],
-            vars={
-                "gParams": self.params,
-                "gParamsMaster": self.params_master,
-                "gParamGrads": self.param_grads,
-                "gMoments1": self.moments1,
-                "gMoments2": self.moments2,
-                "CB": {
-                    "gLearningRate": lr,
-                    "gCurrentStep": float(step),
-                    "gDispatchThreadCount": n,
-                },
+        vars = {
+            "gParams": self.params,
+            "gParamsMaster": self.params_master,
+            "gParamGrads": self.param_grads,
+            "gMoments1": self.moments1,
+            "gMoments2": self.moments2,
+            "CB": {
+                "gLearningRate": lr,
+                "gCurrentStep": float(step),
+                "gDispatchThreadCount": n,
+                "gLossScale": self.loss_scale,
+                "gGradClip": self.grad_clip,
+                "gWeightDecay": self.weight_decay,
             },
-        )
+        }
+        if self.debug:
+            vars["gDebugCounters"] = self.debug_counters
+        self.optimize_k.dispatch(thread_count=[n, 1, 1], vars=vars)
+
+    def read_debug_counters(self) -> dict:
+        """Read and zero the under/overflow tally. Returns fractions of elements."""
+        raw = np.frombuffer(self.debug_counters.to_numpy(), dtype=np.uint32)
+        over, clip, zero, tot = (int(x) for x in raw[:4])
+        tot = max(tot, 1)
+        enc = self.device.create_command_encoder()
+        enc.clear_buffer(self.debug_counters)
+        self.device.submit_command_buffer(enc.finish())
+        return {
+            "overflow": over / tot,
+            "clipped": clip / tot,
+            "zero": zero / tot,
+        }
 
     def eval_density(self) -> np.ndarray:
         """Render the learned density to a [GRID_RES, GRID_RES] numpy array."""
@@ -341,21 +411,24 @@ def train(learner: NDELearner, steps: int, lr: float):
 
     best_jsd = float("inf")
     for step in (bar := trange(1, steps + 1)):
-        # Linear warmup then cosine decay
-        if step <= LR_WARMUP:
-            current_lr = lr * step / LR_WARMUP
-        else:
-            t = (step - LR_WARMUP) / max(steps - LR_WARMUP, 1)
-            current_lr = lr * (0.5 * (1.0 + math.cos(math.pi * t)))
-
+        # Constant learning rate (no warmup/decay schedule).
         learner.train_step(step)
-        learner.optimize_step(step, current_lr)
+        learner.optimize_step(step, lr)
 
         if step % DISPLAY_EVERY == 0 or step == 1:
             density = learner.eval_density()
             jsd = learner.compute_jsd(density)
             best_jsd = min(best_jsd, jsd)
-            bar.set_postfix({"JSD": f"{jsd:.4f}", "best": f"{best_jsd:.4f}"})
+            post = {"JSD": f"{jsd:.4f}", "best": f"{best_jsd:.4f}"}
+            if learner.debug:
+                d = learner.read_debug_counters()
+                # over = float16 accumulator overflowed (lower loss-scale);
+                # zero = gradient underflowed/dead (raise loss-scale);
+                # clip = clip saturating (raise grad-clip or lower loss-scale).
+                post["of/uf/clip"] = (
+                    f"{d['overflow']:.0e}/{d['zero']:.2f}/{d['clipped']:.0e}"
+                )
+            bar.set_postfix(post)
             save_field(density, f"model_step{step:06d}.exr")
 
     return learner
@@ -391,6 +464,23 @@ def main():
         default=False,
         help="Interleave Rotation2D mixing layers between coupling blocks",
     )
+    parser.add_argument(
+        "--activation",
+        choices=sorted(ACTIVATIONS.keys()),
+        default="leakyrelu",
+        help="Conditioner-MLP activation (try swish/gelu/mish for stability)",
+    )
+    parser.add_argument(
+        "--optimizer", choices=["adam", "adamw"], default="adam", help="Optimizer"
+    )
+    parser.add_argument("--loss-scale", type=float, default=LOSS_SCALE)
+    parser.add_argument("--grad-clip", type=float, default=GRAD_CLIP)
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Count gradient under/overflows each eval (to tune --loss-scale)",
+    )
     args = parser.parse_args()
 
     rotations = args.rotations
@@ -398,7 +488,9 @@ def main():
         print(
             "note: rotations push latents outside the uniform support and can lead to artifacts with uniform prior"
         )
-    cfg = build_config(args.flow, args.prior, rotations)
+    cfg = build_config(
+        args.flow, args.prior, rotations, args.activation, args.optimizer, args.debug
+    )
 
     np.random.seed(0)
     if args.image:
@@ -425,7 +517,14 @@ def main():
     )
     device = spy.Device(compiler_options=compiler_options)
 
-    learner = NDELearner(device, samples, cfg)
+    learner = NDELearner(
+        device,
+        samples,
+        cfg,
+        loss_scale=args.loss_scale,
+        grad_clip=args.grad_clip,
+        weight_decay=args.weight_decay,
+    )
     save_field(learner.analytic_hist, "target_hist.exr")
     print("Target histogram saved → target_hist.exr")
     train(learner, args.steps, args.lr)

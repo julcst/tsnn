@@ -5,6 +5,7 @@ struct AdamConfig
     float beta2 = 0.999;
     float epsilon = 1e-8;
     float invLossScale = 1.0;
+    float weightDecay = 0.0;  // decoupled weight decay (AdamW only; ignored by Adam)
 };
 
 struct Adam

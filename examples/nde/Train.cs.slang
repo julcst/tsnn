@@ -26,6 +26,7 @@ cbuffer CB
     uint  gNumSamples;   // total samples in gSamples
     uint  gBatchSize;    // threads per dispatch
     uint  gCurrentStep;
+    float gLossScale;    // gradient pre-scale (undone in Optimize.cs); see below
 }
 
 [numthreads(64, 1, 1)]
@@ -45,13 +46,14 @@ void trainMain(uint3 tid : SV_DispatchThreadID)
     x.y = asfloat(gSamples.Load(dataIdx * 8u + 4u));
 
     // NLL loss gradient: d(-log p(x)) / d(log p(x)) = -1/N.
-    // We scale by a constant (kGradScale) so the per-sample contribution
-    // sits comfortably inside float16's normal range: -1/16384 ≈ 6.1e-5 is at
-    // the float16 min-normal, so grad·activation underflows to zero in the
-    // float16 gradient buffer.  Adam is scale-invariant, so this constant
-    // cancels out of the parameter update and only improves accumulation precision.
-    const float kGradScale = 128.0f;
-    float outputGrad = -kGradScale / float(max(1u, gBatchSize));
+    // We scale by gLossScale so the per-sample contribution sits comfortably
+    // inside float16's normal range: -1/16384 ≈ 6.1e-5 is at the float16
+    // min-normal, so grad·activation would otherwise underflow to zero in the
+    // float16 gradient buffer.  Optimize.cs UNDOES this scale (in float32) before
+    // the optimiser step, so it only buys accumulation precision and does not
+    // change the update — use the debug counters to pick a value that neither
+    // underflows (too small) nor overflows the float16 accumulator (too large).
+    float outputGrad = -gLossScale / float(max(1u, gBatchSize));
 
     var wBuf   = MatrixBiasBuffer(gParams);
     var wGrads = MatrixBiasBufferGrad(gParamGrads);

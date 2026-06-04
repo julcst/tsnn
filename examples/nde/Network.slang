@@ -41,6 +41,11 @@
 #ifndef USE_UNIFORM_PRIOR
 #define USE_UNIFORM_PRIOR 0
 #endif
+// Conditioner-MLP activation (host overrides via defines):
+//   0 ReLU  1 LeakyReLU  2 Swish/SiLU  3 GELU  4 ELU  5 Tanh  6 Mish
+#ifndef ACTIVATION
+#define ACTIVATION 1
+#endif
 
 import TSNN.LinearOps;
 import TSNN.CoopVec;
@@ -68,6 +73,22 @@ static constexpr const uint kParamsPerLayer = 2u;
 #endif
 
 typealias CondMLP = MLP<1u, kHidden, kCondDepth, kParamsPerLayer>;
+
+#if   ACTIVATION == 0
+typealias Activation = ReLU;
+#elif ACTIVATION == 2
+typealias Activation = Swish;
+#elif ACTIVATION == 3
+typealias Activation = GELU;
+#elif ACTIVATION == 4
+typealias Activation = ELU;
+#elif ACTIVATION == 5
+typealias Activation = Tanh;
+#elif ACTIVATION == 6
+typealias Activation = Mish;
+#else
+typealias Activation = LeakyReLU;
+#endif
 
 // The configured base distribution, as a single shared constant (no per-call
 // construction).  UniformPrior matches the bounded box; StandardNormalPrior is
@@ -106,7 +127,7 @@ CoopVec<half, 1u> condInput(float c) { return CoopVecFromVector<half>(vector<flo
 [Differentiable]
 FlowStep coupleForward(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
 {
-    let p = mlp.forward<LeakyReLU>(weights, condInput(cond));
+    let p = mlp.forward<Activation>(weights, condInput(cond));
 #if USE_RQS
     return rqsForward<kNumBins>(transformed, p, kDomain);
 #else
@@ -116,7 +137,7 @@ FlowStep coupleForward(MatrixBiasBuffer weights, CondMLP mlp, float transformed,
 
 float coupleInverse(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
 {
-    let p = mlp.forward<LeakyReLU>(weights, condInput(cond));
+    let p = mlp.forward<Activation>(weights, condInput(cond));
 #if USE_RQS
     return rqsInverse<kNumBins>(transformed, p, kDomain).value;
 #else

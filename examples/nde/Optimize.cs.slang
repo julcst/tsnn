@@ -15,10 +15,20 @@
 // optimizeMain – one Adam step on the float32 master, then mirror to float16.
 
 import TSNN.Optimizers.Adam;
+import TSNN.Optimizers.AdamW;
 import TSNN.Utils.PCG32;
 import TSNN.Utils.RWBuffer;
 import TSNN.Utils.Math;
 import Network;
+
+// Optimizer selection (host overrides via SlangCompilerOptions.defines).
+#ifndef USE_ADAMW
+#define USE_ADAMW 0
+#endif
+// Debug instrumentation: count gradient under/overflows to tune the loss scale.
+#ifndef DEBUG_COUNTERS
+#define DEBUG_COUNTERS 0
+#endif
 
 RWByteAddressBuffer gParams;        // float16 mirror (read by forward/backward)
 RWByteAddressBuffer gParamsMaster;  // float32 master (updated by Adam)
@@ -26,11 +36,20 @@ RWByteAddressBuffer gParamGrads;
 RWByteAddressBuffer gMoments1;
 RWByteAddressBuffer gMoments2;
 
+#if DEBUG_COUNTERS
+// 4 × uint atomic tally: [0]=non-finite (overflow), [1]=clipped (saturation),
+// [2]=exactly-zero (underflow proxy), [3]=elements processed.
+RWByteAddressBuffer gDebugCounters;
+#endif
+
 cbuffer CB
 {
     float gLearningRate;
     float gCurrentStep;
     uint  gDispatchThreadCount;
+    float gLossScale;    // gradients were pre-scaled by this in Train.cs
+    float gGradClip;     // per-element clip, in TRUE (unscaled) gradient units
+    float gWeightDecay;  // AdamW only
 }
 
 [numthreads(256, 1, 1)]
@@ -67,22 +86,61 @@ void resetMain(uint3 tid : SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void optimizeMain(uint3 tid : SV_DispatchThreadID)
 {
-    let adamConfig = AdamConfig(gLearningRate);
-    let adam       = Adam(gCurrentStep, adamConfig);
+    // Loss-scale correction: gradients were scaled up by gLossScale in Train.cs
+    // so they accumulate inside float16's normal range.  We UNDO that here, in
+    // float32, *before* clipping and before the optimiser sees them — so the
+    // clip threshold and Adam's epsilon both act in true gradient units and are
+    // independent of the loss scale.  (The previous code clipped the scaled
+    // gradient, which silently made the effective clip = gGradClip/gLossScale
+    // and the effective epsilon = eps/gLossScale.)
+    let invLossScale = 1.0f / gLossScale;
+
+    // Use the defaulting constructor so beta1/beta2/epsilon get their defaults
+    // (a plain `AdamConfig cfg;` would leave epsilon = 0 → 0/0 NaN on zero grads).
+    AdamConfig cfg = AdamConfig(gLearningRate);
+    cfg.invLossScale = 1.0f;            // already unscaled below
+    cfg.weightDecay  = gWeightDecay;    // AdamW only; Adam ignores it
+#if USE_ADAMW
+    let opt = AdamW(gCurrentStep, cfg);
+#else
+    let opt = Adam(gCurrentStep, cfg);
+#endif
+
+#if DEBUG_COUNTERS
+    uint cOver = 0u, cClip = 0u, cZero = 0u, cTot = 0u;
+#endif
 
     for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
     {
-        var p  = LoadFloat4(gParamsMaster, base);              // float32 master
-        // Clip per-element gradients to tame rare spikes from samples near the
-        // tail bound, which otherwise destabilise late training. The bound is
-        // generous relative to the kGradScale=128 gradient scaling in Train.cs.
-        let g  = clamp(sanitize(LoadHalf4(gParamGrads, base)), float4(-32.0f), float4(32.0f));
-        var m1 = LoadFloat4(gMoments1, base);
-        var m2 = LoadFloat4(gMoments2, base);
-        adam.step(p, m1, m2, g);
+        var p     = LoadFloat4(gParamsMaster, base);            // float32 master
+        let gRaw  = LoadHalf4(gParamGrads, base);               // scaled, float16
+        let gTrue = sanitize(gRaw) * invLossScale;              // unscaled, float32
+        let g     = clamp(gTrue, float4(-gGradClip), float4(gGradClip));
+        var m1    = LoadFloat4(gMoments1, base);
+        var m2    = LoadFloat4(gMoments2, base);
+        opt.step(p, m1, m2, g);
         StoreFloat4(gMoments1,     base, m1);
         StoreFloat4(gMoments2,     base, m2);
         StoreFloat4(gParamsMaster, base, p);                   // keep full-precision master
         StoreHalf4(gParams,        base, p);                   // mirror to float16 for compute
+
+#if DEBUG_COUNTERS
+        [ForceUnroll]
+        for (int c = 0; c < 4; ++c)
+        {
+            cTot++;
+            if (isnan(gRaw[c]) || isinf(gRaw[c]))   cOver++;          // accumulator overflowed
+            else if (gRaw[c] == 0.0f)               cZero++;          // underflowed / dead
+            if (abs(gTrue[c]) > gGradClip)          cClip++;          // clip saturated
+        }
+#endif
     }
+
+#if DEBUG_COUNTERS
+    uint prev;
+    gDebugCounters.InterlockedAdd(0u,  cOver, prev);
+    gDebugCounters.InterlockedAdd(4u,  cClip, prev);
+    gDebugCounters.InterlockedAdd(8u,  cZero, prev);
+    gDebugCounters.InterlockedAdd(12u, cTot,  prev);
+#endif
 }

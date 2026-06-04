@@ -47,6 +47,164 @@ CoopVec<T, K> abs<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
     return v;
 }
 
+// ─── SOTA smooth activations ───────────────────────────────────────────────────
+//
+// Each is element-wise with an explicitly registered backward (the builtin
+// CoopVec operators are not auto-differentiable here, so — like relu/sigmoid
+// above — every activation carries its own [BackwardDerivative]).  The forward
+// and the local derivative are evaluated in float for numerical headroom, then
+// stored back in T.  Smooth activations (Swish/GELU/Mish) keep a non-zero
+// gradient for x<0, which avoids the dead-unit stalls that a hard ReLU/LeakyReLU
+// can cause and tends to stabilise training of the conditioner MLPs.
+
+// Swish / SiLU:  f(x) = x·σ(x)
+[BackwardDerivative(swish_bwd)]
+CoopVec<T, K> swish<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
+{
+    CoopVec<T, K> o;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x = v[i].toFloat();
+        float s = 1.0f / (1.0f + exp(-x));
+        o[i] = T(x * s);
+    }
+    return o;
+}
+
+void swish_bwd<T : __BuiltinFloatingPointType, let K : int>(
+    inout DifferentialPair<CoopVec<T, K>> p, CoopVec<T, K> dResult)
+{
+    CoopVec<T, K> d;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x  = p.p[i].toFloat();
+        float s  = 1.0f / (1.0f + exp(-x));
+        float df = s * (1.0f + x * (1.0f - s));   // σ + x·σ(1−σ)
+        d[i] = T(df * dResult[i].toFloat());
+    }
+    p = diffPair(p.p, d);
+}
+
+// GELU (tanh approximation):  f(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
+static const float kGeluC = 0.7978845608028654f; // √(2/π)
+
+[BackwardDerivative(gelu_bwd)]
+CoopVec<T, K> gelu<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
+{
+    CoopVec<T, K> o;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x = v[i].toFloat();
+        float g = kGeluC * (x + 0.044715f * x * x * x);
+        o[i] = T(0.5f * x * (1.0f + tanh(g)));
+    }
+    return o;
+}
+
+void gelu_bwd<T : __BuiltinFloatingPointType, let K : int>(
+    inout DifferentialPair<CoopVec<T, K>> p, CoopVec<T, K> dResult)
+{
+    CoopVec<T, K> d;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x     = p.p[i].toFloat();
+        float g     = kGeluC * (x + 0.044715f * x * x * x);
+        float th    = tanh(g);
+        float dg    = kGeluC * (1.0f + 3.0f * 0.044715f * x * x);
+        float df    = 0.5f * (1.0f + th) + 0.5f * x * (1.0f - th * th) * dg;
+        d[i] = T(df * dResult[i].toFloat());
+    }
+    p = diffPair(p.p, d);
+}
+
+// ELU:  f(x) = x>0 ? x : α·(exp(x)−1)
+[BackwardDerivative(elu_bwd)]
+CoopVec<T, K> elu<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v, no_diff float alpha = 1.0f)
+{
+    CoopVec<T, K> o;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x = v[i].toFloat();
+        o[i] = T(x > 0.0f ? x : alpha * (exp(x) - 1.0f));
+    }
+    return o;
+}
+
+void elu_bwd<T : __BuiltinFloatingPointType, let K : int>(
+    inout DifferentialPair<CoopVec<T, K>> p, float alpha, CoopVec<T, K> dResult)
+{
+    CoopVec<T, K> d;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x  = p.p[i].toFloat();
+        float df = x > 0.0f ? 1.0f : alpha * exp(x);
+        d[i] = T(df * dResult[i].toFloat());
+    }
+    p = diffPair(p.p, d);
+}
+
+// Tanh:  f(x) = tanh(x)
+[BackwardDerivative(tanhAct_bwd)]
+CoopVec<T, K> tanhAct<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
+{
+    CoopVec<T, K> o;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+        o[i] = T(tanh(v[i].toFloat()));
+    return o;
+}
+
+void tanhAct_bwd<T : __BuiltinFloatingPointType, let K : int>(
+    inout DifferentialPair<CoopVec<T, K>> p, CoopVec<T, K> dResult)
+{
+    CoopVec<T, K> d;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float th = tanh(p.p[i].toFloat());
+        d[i] = T((1.0f - th * th) * dResult[i].toFloat());
+    }
+    p = diffPair(p.p, d);
+}
+
+// Mish:  f(x) = x·tanh(softplus(x)),  softplus(x) = log(1 + exp(x))
+[BackwardDerivative(mish_bwd)]
+CoopVec<T, K> mish<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K> v)
+{
+    CoopVec<T, K> o;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x  = v[i].toFloat();
+        float sp = x > 20.0f ? x : log(1.0f + exp(x));
+        o[i] = T(x * tanh(sp));
+    }
+    return o;
+}
+
+void mish_bwd<T : __BuiltinFloatingPointType, let K : int>(
+    inout DifferentialPair<CoopVec<T, K>> p, CoopVec<T, K> dResult)
+{
+    CoopVec<T, K> d;
+    [ForceUnroll]
+    for (int i = 0; i < K; ++i)
+    {
+        float x   = p.p[i].toFloat();
+        float sp  = x > 20.0f ? x : log(1.0f + exp(x));
+        float th  = tanh(sp);
+        float sig = 1.0f / (1.0f + exp(-x));
+        float df  = th + x * (1.0f - th * th) * sig; // d/dx [x·tanh(sp)]
+        d[i] = T(df * dResult[i].toFloat());
+    }
+    p = diffPair(p.p, d);
+}
+
 // ─── Backward derivatives ─────────────────────────────────────────────────────
 
 // exp is a builtin; register its backward so autodiff can differentiate through it.
