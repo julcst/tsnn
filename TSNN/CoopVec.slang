@@ -98,6 +98,14 @@ void sigmoid_bwd<T : __BuiltinFloatingPointType, let K : int>(
 //   Like VectorFromCoopVec but returns float[N] instead of vector<float,N>,
 //   allowing N > 4.  The backward scatters the float-array gradient back into
 //   the CoopVec differential.
+//
+// NOTE: convert the whole vector in one call and index the returned float[].  A
+// per-element differentiable accessor (a custom-backward `at(v, i)` read) does
+// NOT work here: reading several elements of the same CoopVec fans out to
+// multiple backward calls whose one-hot differentials are not accumulated by
+// this autodiff backend, so all but one element's gradient is silently lost and
+// training diverges.  CoopVecToArray's single backward writes every slot at once
+// and is the correct primitive.
 
 [BackwardDerivative(CoopVecToArray_bwd)]
 float[N] CoopVecToArray<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, N> v)

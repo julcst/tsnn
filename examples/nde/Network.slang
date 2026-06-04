@@ -46,6 +46,7 @@ import TSNN.LinearOps;
 import TSNN.CoopVec;
 import TSNN.Utils.MLP;
 import TSNN.Activations;
+import TSNN.Flows.Bijection;
 import TSNN.Flows.AffineTransform;
 import TSNN.Flows.RQS;
 import TSNN.Flows.Rotation;
@@ -68,20 +69,14 @@ static constexpr const uint kParamsPerLayer = 2u;
 
 typealias CondMLP = MLP<1u, kHidden, kCondDepth, kParamsPerLayer>;
 
+// The configured base distribution, as a single shared constant (no per-call
+// construction).  UniformPrior matches the bounded box; StandardNormalPrior is
+// the unbounded default (use with rotations).
 #if USE_UNIFORM_PRIOR
-typealias Prior = UniformPrior;
+static const UniformPrior gPrior = UniformPrior(kDomain);
 #else
-typealias Prior = StandardNormalPrior;
+static const StandardNormalPrior gPrior = StandardNormalPrior();
 #endif
-
-Prior makePrior()
-{
-#if USE_UNIFORM_PRIOR
-    return UniformPrior(kDomain);
-#else
-    return StandardNormalPrior();
-#endif
-}
 
 // ─── Eight conditioner MLPs chained by byte offset ───────────────────────────
 
@@ -104,26 +99,19 @@ static constexpr const uint kMLPBlockBytes     = kMLP0.end;
 
 // ─── Single coupling step (shared by all layers, both flow types) ─────────────
 
-struct LayerOut : IDifferentiable {
-    float value;
-    float logDet;
-};
-
 // Build the conditioner input CoopVec from a single scalar coordinate.
 [Differentiable]
 CoopVec<half, 1u> condInput(float c) { return CoopVecFromVector<half>(vector<float, 1>(c)); }
 
 [Differentiable]
-LayerOut coupleForward(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
+FlowStep coupleForward(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
 {
     let p = mlp.forward<LeakyReLU>(weights, condInput(cond));
 #if USE_RQS
-    let r = rqsForward<kNumBins>(transformed, p, kDomain);
+    return rqsForward<kNumBins>(transformed, p, kDomain);
 #else
-    let r = affineForward(transformed, p);
+    return affineForward(transformed, p);
 #endif
-    LayerOut o = { r.value, r.logAbsDet };
-    return o;
 }
 
 float coupleInverse(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
@@ -147,26 +135,26 @@ float forward(MatrixBiasBuffer weights, no_diff float2 x)
 
     // four coupling blocks (each updates both coordinates), with a rotation
     // re-mixing the axes between consecutive blocks.
-    { let r = coupleForward(weights, kMLP0, z1, z0); z1 = r.value; logDet += r.logDet; }
-    { let r = coupleForward(weights, kMLP1, z0, z1); z0 = r.value; logDet += r.logDet; }
+    { let r = coupleForward(weights, kMLP0, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
+    { let r = coupleForward(weights, kMLP1, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 #if USE_ROTATIONS
     { let zr = Rotation2D(kRotAngle).apply(float2(z0, z1)); z0 = zr.x; z1 = zr.y; }
 #endif
-    { let r = coupleForward(weights, kMLP2, z1, z0); z1 = r.value; logDet += r.logDet; }
-    { let r = coupleForward(weights, kMLP3, z0, z1); z0 = r.value; logDet += r.logDet; }
+    { let r = coupleForward(weights, kMLP2, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
+    { let r = coupleForward(weights, kMLP3, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 #if USE_ROTATIONS
     { let zr = Rotation2D(kRotAngle).apply(float2(z0, z1)); z0 = zr.x; z1 = zr.y; }
 #endif
-    { let r = coupleForward(weights, kMLP4, z1, z0); z1 = r.value; logDet += r.logDet; }
-    { let r = coupleForward(weights, kMLP5, z0, z1); z0 = r.value; logDet += r.logDet; }
+    { let r = coupleForward(weights, kMLP4, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
+    { let r = coupleForward(weights, kMLP5, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 #if USE_ROTATIONS
     { let zr = Rotation2D(kRotAngle).apply(float2(z0, z1)); z0 = zr.x; z1 = zr.y; }
 #endif
-    { let r = coupleForward(weights, kMLP6, z1, z0); z1 = r.value; logDet += r.logDet; }
-    { let r = coupleForward(weights, kMLP7, z0, z1); z0 = r.value; logDet += r.logDet; }
+    { let r = coupleForward(weights, kMLP6, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
+    { let r = coupleForward(weights, kMLP7, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 
     // base log-density (rotations have det 1 → no log-det term)
-    return makePrior().logProb(float2(z0, z1)) + logDet;
+    return gPrior.logProb(float2(z0, z1)) + logDet;
 }
 
 float forward(ByteAddressBuffer weights, no_diff float2 x)
@@ -176,7 +164,7 @@ float forward(ByteAddressBuffer weights, no_diff float2 x)
 
 // ─── Base sampling + non-differentiable inverse flow ──────────────────────────
 
-float2 samplePrior(float2 u01) { return makePrior().sample(u01); }
+float2 samplePrior(float2 u01) { return gPrior.sample(u01); }
 
 float2 sampleFlow(ByteAddressBuffer weights, float2 z)
 {

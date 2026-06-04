@@ -24,6 +24,7 @@ struct Rotation2D
 
     // Forward mix:  R · z
     [Differentiable]
+    [NoDiffThis] // the rotation parameters are fixed, not learned, so no gradient
     float2 apply(float2 z)
     {
         return float2(c * z.x - s * z.y,

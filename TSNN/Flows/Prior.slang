@@ -54,8 +54,10 @@ struct UniformPrior : IPrior
 
     // Constant inside the box.  A bounded flow (couplings that map the box onto
     // itself) keeps z in-support by construction, so we return the constant
-    // log-density unconditionally; its gradient w.r.t. z is zero.
+    // log-density unconditionally; its gradient w.r.t. z is zero.  [NoDiffThis]:
+    // the density does not depend on z, only on the (constant) halfWidth.
     [Differentiable]
+    [NoDiffThis]
     float logProb(float2 z)
     {
         return -log(4.0f * halfWidth * halfWidth); // -log((2·halfWidth)²)

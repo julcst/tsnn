@@ -12,12 +12,12 @@
 // Boundary derivatives are fixed to an identity slope.
 //
 // API (array form):
-//   rqsForward<K>(x, w[K], h[K], d[K-1], tail) -> RQSResult   [Differentiable]
-//   rqsInverse<K>(y, w[K], h[K], d[K-1], tail) -> RQSResult
+//   rqsForward<K>(x, w[K], h[K], d[K-1], tail) -> FlowStep   [Differentiable]
+//   rqsInverse<K>(y, w[K], h[K], d[K-1], tail) -> FlowStep
 //
 // API (CoopVec form – preferred at call sites):
-//   rqsForward<K>(x, CoopVec<half,3K-1>, tail)  -> RQSResult   [Differentiable]
-//   rqsInverse<K>(y, CoopVec<half,3K-1>, tail)  -> RQSResult
+//   rqsForward<K>(x, CoopVec<half,3K-1>, tail)  -> FlowStep   [Differentiable]
+//   rqsInverse<K>(y, CoopVec<half,3K-1>, tail)  -> FlowStep
 //
 // The packed parameter order is [w(K) | h(K) | d(K-1)].
 //
@@ -28,6 +28,7 @@
 // return arrays/structs through the autodiff path miscompiles here.
 
 import TSNN.CoopVec;
+import TSNN.Flows.Bijection;
 
 static const float kRQSMinBinWidth   = 1e-3f;
 static const float kRQSMinBinHeight  = 1e-3f;
@@ -37,31 +38,15 @@ static const float kRQSMinDerivative = 1e-3f;
 // Used as the fixed unnormalised boundary derivative so knot slopes start at 1.
 static const float kRQSBoundaryUnnorm = 0.5413f;
 
-// ─── Result type ──────────────────────────────────────────────────────────────
-
-struct RQSResult : IDifferentiable {
-    typealias Differential = RQSResult;
-
-    float value;      // transformed coordinate
-    float logAbsDet;  // log|dy/dx| (forward) or -log|dy/dx| (inverse)
-
-    static RQSResult dzero() { RQSResult r = { 0.0f, 0.0f }; return r; }
-    static RQSResult dadd(RQSResult a, RQSResult b)
-    {
-        RQSResult r = { a.value + b.value, a.logAbsDet + b.logAbsDet };
-        return r;
-    }
-};
-
 [Differentiable]
 float rqsSoftplus(float x) { return x > 20.0f ? x : log(1.0f + exp(x)); }
 
 // ─── Array-form forward transform ────────────────────────────────────────────
 
 [Differentiable]
-RQSResult rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 1u], no_diff float tail)
+FlowStep rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 1u], no_diff float tail)
 {
-    if (x <= -tail || x >= tail) { RQSResult r = { x, 0.0f }; return r; }
+    if (x <= -tail || x >= tail) { FlowStep r = { x, 0.0f }; return r; }
 
     // widths: softmax + min-width floor, scaled to span 2·tail
     float widths[K];
@@ -129,15 +114,15 @@ RQSResult rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 
     );
     float logDet = log(dnumer) - 2.0f * log(abs(denom));
 
-    RQSResult r = { y, logDet };
+    FlowStep r = { y, logDet };
     return r;
 }
 
 // ─── Array-form inverse transform ────────────────────────────────────────────
 
-RQSResult rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 1u], float tail)
+FlowStep rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 1u], float tail)
 {
-    if (y <= -tail || y >= tail) { RQSResult r = { y, 0.0f }; return r; }
+    if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float widths[K];
     float maxW = w[0];
@@ -207,14 +192,14 @@ RQSResult rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 
     );
     float logDet = log(dnumer) - 2.0f * log(abs(denom));
 
-    RQSResult r = { x, -logDet };
+    FlowStep r = { x, -logDet };
     return r;
 }
 
 // ─── CoopVec-form overloads (unpack packed [w|h|d] internally) ────────────────
 
 [Differentiable]
-RQSResult rqsForward<let K : uint>(float x, CoopVec<half, 3u * K - 1u> cv, no_diff float tail)
+FlowStep rqsForward<let K : uint>(float x, CoopVec<half, 3u * K - 1u> cv, no_diff float tail)
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K - 1u];
@@ -224,7 +209,7 @@ RQSResult rqsForward<let K : uint>(float x, CoopVec<half, 3u * K - 1u> cv, no_di
     return rqsForward<K>(x, w, h, d, tail);
 }
 
-RQSResult rqsInverse<let K : uint>(float y, CoopVec<half, 3u * K - 1u> cv, float tail)
+FlowStep rqsInverse<let K : uint>(float y, CoopVec<half, 3u * K - 1u> cv, float tail)
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K - 1u];

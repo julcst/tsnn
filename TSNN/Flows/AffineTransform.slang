@@ -2,12 +2,12 @@
 // Affine bijection: y = x · exp(s) + t,  log|dy/dx| = s.
 //
 // API (scalar form):
-//   affineForward(no_diff x, s_raw, t) -> AffineResult   [Differentiable]
-//   affineInverse(y, s_raw, t)         -> AffineResult
+//   affineForward(x, s_raw, t) -> FlowStep   [Differentiable]
+//   affineInverse(y, s_raw, t) -> FlowStep
 //
 // API (CoopVec form – preferred at call sites):
-//   affineForward(no_diff x, CoopVec<half,2>) -> AffineResult   [Differentiable]
-//   affineInverse(y,         CoopVec<half,2>) -> AffineResult
+//   affineForward(x, CoopVec<half,2>) -> FlowStep   [Differentiable]
+//   affineInverse(y, CoopVec<half,2>) -> FlowStep
 //
 // The MLP outputs an *unbounded* raw log-scale s_raw; we soft-clamp it to
 //   s = kAffineMaxScale · (2·sigmoid(s_raw) − 1) ∈ (−kAffineMaxScale, kAffineMaxScale)
@@ -20,33 +20,9 @@
 // Identity init: MLP output weights & biases = 0 ⇒ s_raw = 0 ⇒ s = 0, t = 0.
 
 import TSNN.CoopVec;
+import TSNN.Flows.Bijection;
 
 static const float kAffineMaxScale = 4.0f;
-
-// ─── Result type ──────────────────────────────────────────────────────────────
-
-struct AffineResult : IDifferentiable {
-    typealias Differential = AffineResult;
-
-    float value;      // transformed coordinate
-    float logAbsDet;  // log|dy/dx| (= s for forward, = -s for inverse)
-
-    static AffineResult dzero()
-    {
-        AffineResult r;
-        r.value     = 0.0f;
-        r.logAbsDet = 0.0f;
-        return r;
-    }
-
-    static AffineResult dadd(AffineResult a, AffineResult b)
-    {
-        AffineResult r;
-        r.value     = a.value     + b.value;
-        r.logAbsDet = a.logAbsDet + b.logAbsDet;
-        return r;
-    }
-};
 
 // sigmoid using only exp() — exp has a registered backward in CoopVec.slang.
 [Differentiable]
@@ -64,19 +40,16 @@ float affineScale(float s_raw) { return kAffineMaxScale * (2.0f * affineSigmoid(
 // parameters and yields a wrong gradient.  The raw data input is passed in as a
 // no_diff value at the top level, which correctly contributes zero data-gradient.
 [Differentiable]
-AffineResult affineForward(float x, float s_raw, float t)
+FlowStep affineForward(float x, float s_raw, float t)
 {
     float s = affineScale(s_raw);
-    AffineResult r;
-    r.value     = x * exp(s) + t;
-    r.logAbsDet = s;
-    return r;
+    return { x * exp(s) + t, s };
 }
 
 // ─── CoopVec-form forward (cv = [s_raw, t]) ──────────────────────────────────
 
 [Differentiable]
-AffineResult affineForward(float x, CoopVec<half, 2u> cv)
+FlowStep affineForward(float x, CoopVec<half, 2u> cv)
 {
     let arr = CoopVecToArray(cv);
     return affineForward(x, arr[0], arr[1]);
@@ -84,18 +57,15 @@ AffineResult affineForward(float x, CoopVec<half, 2u> cv)
 
 // ─── Scalar-form inverse ──────────────────────────────────────────────────────
 
-AffineResult affineInverse(float y, float s_raw, float t)
+FlowStep affineInverse(float y, float s_raw, float t)
 {
     float s = affineScale(s_raw);
-    AffineResult r;
-    r.value     = (y - t) * exp(-s);
-    r.logAbsDet = -s;
-    return r;
+    return { (y - t) * exp(-s), -s };
 }
 
 // ─── CoopVec-form inverse ─────────────────────────────────────────────────────
 
-AffineResult affineInverse(float y, CoopVec<half, 2u> cv)
+FlowStep affineInverse(float y, CoopVec<half, 2u> cv)
 {
     let arr = CoopVecToArray(cv);
     return affineInverse(y, arr[0], arr[1]);

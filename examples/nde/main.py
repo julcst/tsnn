@@ -163,6 +163,7 @@ def analytic_histogram(samples: np.ndarray, grid_res: int, bound: float) -> np.n
 def save_field(arr: np.ndarray, path) -> None:
     """Write a 2-D float field as an RGBA float .exr (rows flipped so y is up)."""
     a = np.ascontiguousarray(arr[::-1].astype(np.float32))
+    a = a / a.max()  # normalise for better contrast
     rgba = np.stack([a, a, a, np.ones_like(a)], axis=-1)
     spy.Bitmap(rgba, spy.Bitmap.PixelFormat.rgba).write(Path(path))
 
@@ -381,13 +382,13 @@ def main():
     parser.add_argument(
         "--prior",
         choices=["normal", "uniform"],
-        default="normal",
+        default="uniform",
         help="Base distribution",
     )
     parser.add_argument(
         "--rotations",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Interleave Rotation2D mixing layers between coupling blocks",
     )
     args = parser.parse_args()
