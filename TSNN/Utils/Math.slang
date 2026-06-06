@@ -42,14 +42,25 @@ uint32_t morton3D(uint3 v) {
     return xx | (yy << 1) | (zz << 2);
 }
 
-float sanitize(float x, float fallback = 0.0f)
+// Maps a uniformly random 32-bit integer to a float uniformly distributed in
+// [0, 1).  Rather than `(float(x) + 0.5) / 2^32`, which pays an int→float
+// conversion and rounds non-uniformly, we paste the top 23 bits of `x` into the
+// mantissa of a float in [1, 2) and subtract 1.  This is a couple of cheap
+// integer ops, is exact, and yields exactly 2^23 equally-spaced values with no
+// bias — the fastest and most numerically stable construction in common use.
+float uintToUnitFloat(uint x)
 {
-    return (isnan(x) || isinf(x)) ? fallback : x;
+    return reinterpret<float>(0x3f800000u | (x >> 9u)) - 1.0f;
 }
 
-float4 sanitize(float4 v, float fallback = 0.0f)
+// Vector overload — same construction applied component-wise.
+vector<float, N> uintToUnitFloat<uint N>(vector<uint, N> x)
 {
-    return float4(sanitize(v.x, fallback), sanitize(v.y, fallback), sanitize(v.z, fallback), sanitize(v.w, fallback));
+    vector<float, N> r;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+        r[i] = uintToUnitFloat(x[i]);
+    return r;
 }
 
 [Differentiable]

@@ -15,16 +15,14 @@
 // optimizeMain – one Adam step on the float32 master, then mirror to float16.
 
 import TSNN.Optimizers.Adam;
-import TSNN.Optimizers.AdamW;
+import TSNN.Optimizers.Sanitizer;
 import TSNN.Utils.PCG32;
 import TSNN.Utils.RWBuffer;
 import TSNN.Utils.Math;
 import Network;
 
-// Optimizer selection (host overrides via SlangCompilerOptions.defines).
-#ifndef USE_ADAMW
-#define USE_ADAMW 0
-#endif
+// Adam vs AdamW is now selected purely by gWeightDecay (0 → Adam, > 0 → AdamW);
+// no separate kernel variant is needed.
 // Debug instrumentation: count gradient under/overflows to tune the loss scale.
 #ifndef DEBUG_COUNTERS
 #define DEBUG_COUNTERS 0
@@ -49,7 +47,7 @@ cbuffer CB
     uint  gDispatchThreadCount;
     float gLossScale;    // gradients were pre-scaled by this in Train.cs
     float gGradClip;     // per-element clip, in TRUE (unscaled) gradient units
-    float gWeightDecay;  // AdamW only
+    float gWeightDecay;  // 0 → Adam, > 0 → AdamW (decoupled decay)
 }
 
 [numthreads(256, 1, 1)]
@@ -98,24 +96,23 @@ void optimizeMain(uint3 tid : SV_DispatchThreadID)
     // Use the defaulting constructor so beta1/beta2/epsilon get their defaults
     // (a plain `AdamConfig cfg;` would leave epsilon = 0 → 0/0 NaN on zero grads).
     AdamConfig cfg = AdamConfig(gLearningRate);
-    cfg.invLossScale = 1.0f;            // already unscaled below
-    cfg.weightDecay  = gWeightDecay;    // AdamW only; Adam ignores it
-#if USE_ADAMW
-    let opt = AdamW(gCurrentStep, cfg);
-#else
+    cfg.invLossScale = invLossScale;    // applied inside Adam.step
+    cfg.weightDecay  = gWeightDecay;    // 0 → Adam, > 0 → AdamW (decoupled decay)
     let opt = Adam(gCurrentStep, cfg);
-#endif
 
 #if DEBUG_COUNTERS
-    uint cOver = 0u, cClip = 0u, cZero = 0u, cTot = 0u;
+    SanitizeDebugCounter dbg = SanitizeDebugCounter();
 #endif
 
     for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
     {
         var p     = LoadFloat4(gParamsMaster, base);            // float32 master
         let gRaw  = LoadHalf4(gParamGrads, base);               // scaled, float16
-        let gTrue = sanitize(gRaw) * invLossScale;              // unscaled, float32
-        let g     = clamp(gTrue, float4(-gGradClip), float4(gGradClip));
+#if DEBUG_COUNTERS
+        let g     = sanitizeDebug(gRaw, gGradClip, dbg);        // scrub + clip + tally
+#else
+        let g     = sanitize(gRaw, gGradClip);                  // scrub + clip
+#endif
         var m1    = LoadFloat4(gMoments1, base);
         var m2    = LoadFloat4(gMoments2, base);
         opt.step(p, m1, m2, g);
@@ -123,24 +120,9 @@ void optimizeMain(uint3 tid : SV_DispatchThreadID)
         StoreFloat4(gMoments2,     base, m2);
         StoreFloat4(gParamsMaster, base, p);                   // keep full-precision master
         StoreHalf4(gParams,        base, p);                   // mirror to float16 for compute
-
-#if DEBUG_COUNTERS
-        [ForceUnroll]
-        for (int c = 0; c < 4; ++c)
-        {
-            cTot++;
-            if (isnan(gRaw[c]) || isinf(gRaw[c]))   cOver++;          // accumulator overflowed
-            else if (gRaw[c] == 0.0f)               cZero++;          // underflowed / dead
-            if (abs(gTrue[c]) > gGradClip)          cClip++;          // clip saturated
-        }
-#endif
     }
 
 #if DEBUG_COUNTERS
-    uint prev;
-    gDebugCounters.InterlockedAdd(0u,  cOver, prev);
-    gDebugCounters.InterlockedAdd(4u,  cClip, prev);
-    gDebugCounters.InterlockedAdd(8u,  cZero, prev);
-    gDebugCounters.InterlockedAdd(12u, cTot,  prev);
+    dbg.flush(gDebugCounters);
 #endif
 }

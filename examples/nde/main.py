@@ -106,7 +106,6 @@ def build_config(
             "USE_ROTATIONS": str(int(rotations)),
             "USE_UNIFORM_PRIOR": str(int(use_uniform)),
             "ACTIVATION": str(ACTIVATIONS[activation]),
-            "USE_ADAMW": str(int(optimizer == "adamw")),
             "DEBUG_COUNTERS": str(int(debug)),
         },
         "debug": debug,
@@ -517,13 +516,16 @@ def main():
     )
     device = spy.Device(compiler_options=compiler_options)
 
+    # Adam and AdamW share one kernel now; the only difference is the decoupled
+    # weight-decay term, gated on gWeightDecay. Plain Adam = zero decay.
+    weight_decay = args.weight_decay if args.optimizer == "adamw" else 0.0
     learner = NDELearner(
         device,
         samples,
         cfg,
         loss_scale=args.loss_scale,
         grad_clip=args.grad_clip,
-        weight_decay=args.weight_decay,
+        weight_decay=weight_decay,
     )
     save_field(learner.analytic_hist, "target_hist.exr")
     print("Target histogram saved → target_hist.exr")

@@ -2,6 +2,7 @@
 // Vectorized float4/half4 processing for maximum memory bandwidth.
 
 import TSNN.Optimizers.Adam;
+import TSNN.Optimizers.Sanitizer;
 import TSNN.Utils.PCG32;
 import TSNN.Utils.RWBuffer;
 import TSNN.Utils.Math;

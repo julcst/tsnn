@@ -46,12 +46,10 @@ void evalNLLMain(uint3 tid : SV_DispatchThreadID)
     uint idx = tid.x;
     if (idx >= gNLLCount) return;
 
-    float2 x;
-    x.x = asfloat(gTestSamples.Load(idx * 8u + 0u));
-    x.y = asfloat(gTestSamples.Load(idx * 8u + 4u));
+    let x = gTestSamples.LoadAligned<float2>(idx * sizeof(float2));  // Load float2 sample (8 bytes) from buffer
 
     float logp = forward(gParams, x);
-    gLogProbsOut.Store(idx * 4u, asuint(logp));
+    gLogProbsOut.StoreAligned(idx * sizeof(float), logp);
 }
 
 // ─── Sampling ─────────────────────────────────────────────────────────────────
@@ -73,12 +71,10 @@ void sampleMain(uint3 tid : SV_DispatchThreadID)
 
     // Draw a base latent from the configured prior, then run the inverse flow.
     let r    = pcg3d(uint3(gSeed, idx, 1u));
-    float2 u01 = float2((float(r.x) + 0.5f) / 4294967296.0f,
-                        (float(r.y) + 0.5f) / 4294967296.0f);
-    float2 z = samplePrior(u01);
+    float2 u01 = uintToUnitFloat(r.xy);
+    float2 z   = samplePrior(u01);
 
     float2 x = sampleFlow(gParams, z);
 
-    gSampleOut.Store(idx * 8u + 0u, asuint(x.x));
-    gSampleOut.Store(idx * 8u + 4u, asuint(x.y));
+    gSampleOut.StoreAligned(idx * sizeof(float2), x);
 }

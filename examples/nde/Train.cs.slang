@@ -41,9 +41,7 @@ void trainMain(uint3 tid : SV_DispatchThreadID)
     uint dataIdx = rand.x % gNumSamples;
 
     // Load float2 sample from buffer (2 × float32 = 8 bytes per sample)
-    float2 x;
-    x.x = asfloat(gSamples.Load(dataIdx * 8u + 0u));
-    x.y = asfloat(gSamples.Load(dataIdx * 8u + 4u));
+    float2 x = gSamples.LoadAligned<float2>(dataIdx * sizeof(float2));
 
     // NLL loss gradient: d(-log p(x)) / d(log p(x)) = -1/N.
     // We scale by gLossScale so the per-sample contribution sits comfortably
