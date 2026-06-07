@@ -3,9 +3,9 @@
 
 import TSNN.Optimizers.Adam;
 import TSNN.Optimizers.Sanitizer;
-import TSNN.Utils.PCG32;
 import TSNN.Utils.RWBuffer;
-import TSNN.Utils.Math;
+import TSNN.Utils.MLP;
+import TSNN.Encodings.FeatureBuffer;
 import Network;
 
 RWByteAddressBuffer gParams;
@@ -27,23 +27,11 @@ cbuffer CB
 [numthreads(256, 1, 1)]
 void resetMain(uint3 tid: SV_DispatchThreadID)
 {
-    PCG32 rng = PCG32(uint64_t(tid.x), uint64_t(tid.x) ^ 0x9e3779b97f4a7c15ULL);
-
-    for (uint i = tid.x; i < kParamElementCount; i += gDispatchThreadCount)
-    {
-        float scale = sqrt(2.0f / float(64));
-        float p = rng.nextFloat() * 2.0f - 1.0f;
-        gParams.StoreAligned<half>(i * sizeof(half), half(p * scale));
-        gMoments1.StoreAligned<float>(i * sizeof(float), 0.0f);
-        gMoments2.StoreAligned<float>(i * sizeof(float), 0.0f);
-    }
-    for (uint i = tid.x; i < kEncodingParamElementCount; i += gDispatchThreadCount)
-    {
-        float p = rng.nextFloat() * 2.0f - 1.0f;
-        gEncodingParams.StoreAligned<half>(i * sizeof(half), half(p * 1e-3f));
-        gEncodingMoments1.StoreAligned<float>(i * sizeof(float), 0.0f);
-        gEncodingMoments2.StoreAligned<float>(i * sizeof(float), 0.0f);
-    }
+    // SOTA He init for the MLP weights and tiny-random init for the hash grid;
+    // each helper owns its coalesced loop.  Adam moments are zeroed host-side
+    // (clear_buffer in main.py).
+    kMLP.initParams<half>(gParams, tid.x, gDispatchThreadCount);
+    initFeatures<half>(gEncodingParams, kEncodingParamElementCount, tid.x, gDispatchThreadCount);
 }
 
 [numthreads(256, 1, 1)]

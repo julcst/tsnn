@@ -113,10 +113,8 @@ static constexpr const CondMLP kMLP7 = CondMLP(kMLP6.end);
 static constexpr const uint kParamByteCount    = kMLP7.end;
 static constexpr const uint kParamElementCount = kParamByteCount / sizeof(half);
 
-// Output layer starts here; everything from this offset to kMLPBlockBytes is
-// zeroed at init so each coupling begins as the identity transform.
-static constexpr const uint kOutputWeightStart = kMLP0.offsets[kCondDepth].x;
-static constexpr const uint kMLPBlockBytes     = kMLP0.end;
+// Identity init (He hidden layers + zeroed last layer per block) is handled by
+// MLP::initParams, called once per kMLP0..kMLP7 block in Optimize.cs::resetMain.
 
 // ─── Single coupling step (shared by all layers, both flow types) ─────────────
 

@@ -170,19 +170,13 @@ class ImageLearner:
             )
         )
 
-        # Reset parameters
+        # Reset parameters (weights + hash grid). Adam moments are just zeroed.
         dispatch_count = 256 * 8
         self.reset_kernel.dispatch(
             thread_count=[dispatch_count, 1, 1],
             vars={
                 "gParams": self.params,
-                "gParamGrads": self.param_grads,
-                "gMoments1": self.moments1,
-                "gMoments2": self.moments2,
                 "gEncodingParams": self.enc_params,
-                "gEncodingParamGrads": self.enc_grads,
-                "gEncodingMoments1": self.enc_moments1,
-                "gEncodingMoments2": self.enc_moments2,
                 "CB": {
                     "gLearningRate": LR,
                     "gCurrentStep": 1.0,
@@ -190,6 +184,10 @@ class ImageLearner:
                 },
             },
         )
+        encoder = device.create_command_encoder()
+        for buf in (self.moments1, self.moments2, self.enc_moments1, self.enc_moments2):
+            encoder.clear_buffer(buf)
+        device.submit_command_buffer(encoder.finish())
 
     def zero_gradients(self):
         encoder = self.device.create_command_encoder()

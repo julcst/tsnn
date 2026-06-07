@@ -284,9 +284,6 @@ class NDELearner:
             vars={
                 "gParams": self.params,
                 "gParamsMaster": self.params_master,
-                "gParamGrads": self.param_grads,
-                "gMoments1": self.moments1,
-                "gMoments2": self.moments2,
                 "CB": {
                     "gLearningRate": LR,
                     "gCurrentStep": 1.0,
@@ -297,6 +294,11 @@ class NDELearner:
                 },
             },
         )
+        # Adam moments start at zero (the reset kernel no longer writes them).
+        enc = self.device.create_command_encoder()
+        enc.clear_buffer(self.moments1)
+        enc.clear_buffer(self.moments2)
+        self.device.submit_command_buffer(enc.finish())
 
     def zero_grads(self):
         enc = self.device.create_command_encoder()

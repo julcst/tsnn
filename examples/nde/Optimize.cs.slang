@@ -16,9 +16,9 @@
 
 import TSNN.Optimizers.Adam;
 import TSNN.Optimizers.Sanitizer;
-import TSNN.Utils.PCG32;
 import TSNN.Utils.RWBuffer;
 import TSNN.Utils.Math;
+import TSNN.Utils.MLP;
 import Network;
 
 // Adam vs AdamW is now selected purely by gWeightDecay (0 → Adam, > 0 → AdamW);
@@ -53,32 +53,20 @@ cbuffer CB
 [numthreads(256, 1, 1)]
 void resetMain(uint3 tid : SV_DispatchThreadID)
 {
-    PCG32 rng = PCG32(uint64_t(tid.x), uint64_t(tid.x) ^ 0x9e3779b97f4a7c15ULL);
-
-    float hiddenScale = sqrt(2.0f / float(kHidden));
-
-    for (uint i = tid.x; i < kParamElementCount; i += gDispatchThreadCount)
-    {
-        uint byteOff   = i * sizeof(half);
-        uint localByte = byteOff % kMLPBlockBytes;
-
-        float val;
-        if (localByte >= kOutputWeightStart)
-        {
-            // Output-layer weights and biases → zero so the initial transform is identity
-            val = 0.0f;
-        }
-        else
-        {
-            // Hidden layers → small He/Xavier random
-            val = (rng.nextFloat() * 2.0f - 1.0f) * hiddenScale;
-        }
-
-        gParamsMaster.StoreAligned<float>(i * sizeof(float), val);
-        gParams.StoreAligned<half>(byteOff, half(val));
-        gMoments1.StoreAligned<float>(i * sizeof(float), 0.0f);
-        gMoments2.StoreAligned<float>(i * sizeof(float), 0.0f);
-    }
+    // Identity init: hidden layers get SOTA He init, the last layer of every
+    // coupling MLP is zeroed so each coupling begins as the identity transform.
+    // One call per block — each fills its own float16 mirror + float32 master
+    // slice (the helper keys the draw on the absolute byte offset, so the eight
+    // identically-shaped blocks still get independent weights).
+    kMLP0.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP1.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP2.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP3.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP4.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP5.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP6.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    kMLP7.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
+    // Adam moments are zeroed host-side (clear_buffer in main.py).
 }
 
 [numthreads(256, 1, 1)]

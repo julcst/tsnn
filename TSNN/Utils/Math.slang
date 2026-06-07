@@ -69,6 +69,21 @@ float luminance(float3 rgb)
     return dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
+// Box–Muller: two independent standard normals from two uniforms in [0, 1).
+float2 boxMuller(float2 u)
+{
+    let r     = sqrt(-2.0f * log(max(u.x, 1e-7f))); // clamp avoids log(0)
+    let theta = 6.28318530718f * u.y;
+    return float2(r * cos(theta), r * sin(theta));
+}
+
+// One standard normal N(0, 1) keyed on a 2-D integer seed.  Keyed (not stateful)
+// so callers stay order-independent — same seed always yields the same draw.
+float randNormal(uint2 seed)
+{
+    return boxMuller(uintToUnitFloat(pcg2d(seed))).x;
+}
+
 // https://www.pcg-random.org/
 uint pcg(uint v)
 {

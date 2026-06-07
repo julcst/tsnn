@@ -3,6 +3,22 @@
 // backward derivatives for gradient accumulation.
 
 import CoopVec;
+import Utils.Math;
+
+// Coalesced init for a learnable feature table, stored as `T` (e.g. half): tiny
+// symmetric random values, the standard hash-grid scheme (instant-ngp uses
+// U(±1e-4) so the initial encoding is near-zero and the MLP drives early
+// learning).  Owns the whole strided loop; pass the reset dispatch's thread id /
+// count and the table's element count.
+void initFeatures<T : __BuiltinFloatingPointType>(
+    RWByteAddressBuffer features, uint count, uint tid, uint threadCount, float scale = 1e-4f)
+{
+    for (uint i = tid; i < count; i += threadCount)
+    {
+        let u = 2.0f * uintToUnitFloat(pcg2d(uint2(i, 0xa511e9b3u)).x) - 1.0f;
+        features.StoreAligned<T>(i * uint(sizeof(T)), T(u * scale));
+    }
+}
 
 struct FeatureBufferGrad : IDifferentiablePtrType
 {
