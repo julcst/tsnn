@@ -62,7 +62,13 @@ import TSNN.Utils.Math;
 
 static constexpr const uint  kHidden    = 64u;
 static constexpr const uint  kCondDepth = 2u;
-static constexpr const uint  kNumBins   = 16u;  // RQS bins (USE_RQS only)
+// RQS bins.  [ForceUnroll] in RQS.slang unrolls every loop to kNumBins iterations,
+// so this is a hard multiplier on per-thread shader complexity.  The GPU watchdog
+// (NVRM XID 109 / CTX SWITCH TIMEOUT) fires when a kernel takes >~2 s.
+// Safe ranges observed in practice:  8–16 bins for ≥4 layers;  32 bins for ≤2 layers.
+// Mueller et al. use 32-bin piecewise-quadratic with 2 layers; 16-bin RQS is
+// roughly equivalent (RQS is more expressive per bin).
+static constexpr const uint  kNumBins   = 32u;
 static constexpr const float kDomain    = 1.0f; // data/latent domain [-1, 1]
 static const          float  kRotAngle  = 0.39269908f; // π/8 between coupling blocks
 
@@ -99,22 +105,20 @@ static const UniformPrior gPrior = UniformPrior(kDomain);
 static const StandardNormalPrior gPrior = StandardNormalPrior();
 #endif
 
-// ─── Eight conditioner MLPs chained by byte offset ───────────────────────────
+// ─── Four conditioner MLPs chained by byte offset ────────────────────────────
+// Mueller et al. use 2 coupling layers with a deep U-net conditioner; we use 4
+// with a simpler MLP conditioner to compensate, staying within GPU timeout bounds.
 
 static constexpr const CondMLP kMLP0 = CondMLP(0u);
 static constexpr const CondMLP kMLP1 = CondMLP(kMLP0.end);
 static constexpr const CondMLP kMLP2 = CondMLP(kMLP1.end);
 static constexpr const CondMLP kMLP3 = CondMLP(kMLP2.end);
-static constexpr const CondMLP kMLP4 = CondMLP(kMLP3.end);
-static constexpr const CondMLP kMLP5 = CondMLP(kMLP4.end);
-static constexpr const CondMLP kMLP6 = CondMLP(kMLP5.end);
-static constexpr const CondMLP kMLP7 = CondMLP(kMLP6.end);
 
-static constexpr const uint kParamByteCount    = kMLP7.end;
+static constexpr const uint kParamByteCount    = kMLP3.end;
 static constexpr const uint kParamElementCount = kParamByteCount / sizeof(half);
 
 // Identity init (He hidden layers + zeroed last layer per block) is handled by
-// MLP::initParams, called once per kMLP0..kMLP7 block in Optimize.cs::resetMain.
+// MLP::initParams, called once per kMLP0..kMLP3 block in Optimize.cs::resetMain.
 
 // ─── Single coupling step (shared by all layers, both flow types) ─────────────
 
@@ -143,6 +147,19 @@ float coupleInverse(MatrixBiasBuffer weights, CondMLP mlp, float transformed, fl
 #endif
 }
 
+// Like coupleInverse but returns the full FlowStep.  logAbsDet carries the
+// INVERSE sign (−) per the Bijection.slang convention, so the caller must
+// negate it to recover the forward log|det| at this point.
+FlowStep coupleInverseStep(MatrixBiasBuffer weights, CondMLP mlp, float transformed, float cond)
+{
+    let p = mlp.forward<Activation>(weights, condInput(cond));
+#if USE_RQS
+    return rqsInverse<kNumBins>(transformed, p, kDomain);
+#else
+    return affineInverse(transformed, p);
+#endif
+}
+
 // ─── Differentiable forward pass ─────────────────────────────────────────────
 
 [Differentiable]
@@ -152,8 +169,8 @@ float forward(MatrixBiasBuffer weights, no_diff float2 x)
     float z1 = x.y;
     float logDet = 0.0f;
 
-    // four coupling blocks (each updates both coordinates), with a rotation
-    // re-mixing the axes between consecutive blocks.
+    // Two coupling blocks (each updates both coordinates), with one optional
+    // rotation re-mixing the axes between them.
     { let r = coupleForward(weights, kMLP0, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
     { let r = coupleForward(weights, kMLP1, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 #if USE_ROTATIONS
@@ -161,16 +178,6 @@ float forward(MatrixBiasBuffer weights, no_diff float2 x)
 #endif
     { let r = coupleForward(weights, kMLP2, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
     { let r = coupleForward(weights, kMLP3, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
-#if USE_ROTATIONS
-    { let zr = Rotation2D(kRotAngle).apply(float2(z0, z1)); z0 = zr.x; z1 = zr.y; }
-#endif
-    { let r = coupleForward(weights, kMLP4, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
-    { let r = coupleForward(weights, kMLP5, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
-#if USE_ROTATIONS
-    { let zr = Rotation2D(kRotAngle).apply(float2(z0, z1)); z0 = zr.x; z1 = zr.y; }
-#endif
-    { let r = coupleForward(weights, kMLP6, z1, z0); z1 = r.value; logDet += r.logAbsDet; }
-    { let r = coupleForward(weights, kMLP7, z0, z1); z0 = r.value; logDet += r.logAbsDet; }
 
     // base log-density (rotations have det 1 → no log-det term)
     return gPrior.logProb(float2(z0, z1)) + logDet;
@@ -187,28 +194,34 @@ float2 samplePrior(float2 u01) { return gPrior.sample(u01); }
 
 float2 sampleFlow(ByteAddressBuffer weights, float2 z)
 {
+    return sampleFlowLogProb(weights, z).x;
+}
+
+// ─── Joint sample + log-prob (used by the KL training kernel) ─────────────────
+
+struct FlowSample { float2 x; float logProb; }
+
+// Returns x ~ q_θ AND log q_θ(x) in a single inverse pass.
+// Avoids the redundant forward() call that sampleFlow() + forward() would
+// require: two flow evaluations total instead of three.
+//
+// logDet accumulates the FORWARD log|det J_f(x)| by negating each inverse
+// step's logAbsDet (signed − for inverse per Bijection.slang).
+FlowSample sampleFlowLogProb(ByteAddressBuffer weights, float2 z)
+{
     let buf = MatrixBiasBuffer(weights);
     float x0 = z.x;
     float x1 = z.y;
+    float logDet = 0.0f;
 
-    // Exact reverse of forward(): invert each block, undo each rotation.
-    x0 = coupleInverse(buf, kMLP7, x0, x1);
-    x1 = coupleInverse(buf, kMLP6, x1, x0);
+    { let r = coupleInverseStep(buf, kMLP3, x0, x1); x0 = r.value; logDet -= r.logAbsDet; }
+    { let r = coupleInverseStep(buf, kMLP2, x1, x0); x1 = r.value; logDet -= r.logAbsDet; }
 #if USE_ROTATIONS
     { let zr = Rotation2D(kRotAngle).applyInverse(float2(x0, x1)); x0 = zr.x; x1 = zr.y; }
 #endif
-    x0 = coupleInverse(buf, kMLP5, x0, x1);
-    x1 = coupleInverse(buf, kMLP4, x1, x0);
-#if USE_ROTATIONS
-    { let zr = Rotation2D(kRotAngle).applyInverse(float2(x0, x1)); x0 = zr.x; x1 = zr.y; }
-#endif
-    x0 = coupleInverse(buf, kMLP3, x0, x1);
-    x1 = coupleInverse(buf, kMLP2, x1, x0);
-#if USE_ROTATIONS
-    { let zr = Rotation2D(kRotAngle).applyInverse(float2(x0, x1)); x0 = zr.x; x1 = zr.y; }
-#endif
-    x0 = coupleInverse(buf, kMLP1, x0, x1);
-    x1 = coupleInverse(buf, kMLP0, x1, x0);
+    { let r = coupleInverseStep(buf, kMLP1, x0, x1); x0 = r.value; logDet -= r.logAbsDet; }
+    { let r = coupleInverseStep(buf, kMLP0, x1, x0); x1 = r.value; logDet -= r.logAbsDet; }
 
-    return float2(x0, x1);
+    // log q(x) = log p_0(z) + log|det J_f(x)|;  prior evaluated at the base latent z.
+    return { float2(x0, x1), gPrior.logProb(z) + logDet };
 }

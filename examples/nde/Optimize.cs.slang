@@ -53,19 +53,12 @@ cbuffer CB
 [numthreads(256, 1, 1)]
 void resetMain(uint3 tid : SV_DispatchThreadID)
 {
-    // Identity init: hidden layers get SOTA He init, the last layer of every
-    // coupling MLP is zeroed so each coupling begins as the identity transform.
-    // One call per block — each fills its own float16 mirror + float32 master
-    // slice (the helper keys the draw on the absolute byte offset, so the eight
-    // identically-shaped blocks still get independent weights).
+    // Identity init: hidden layers get He init, the last layer of every coupling
+    // MLP is zeroed so each coupling begins as the identity transform.
     kMLP0.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
     kMLP1.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
     kMLP2.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
     kMLP3.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
-    kMLP4.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
-    kMLP5.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
-    kMLP6.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
-    kMLP7.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount, MLPInit::HeNormal, true);
     // Adam moments are zeroed host-side (clear_buffer in main.py).
 }
 

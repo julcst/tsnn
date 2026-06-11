@@ -1,32 +1,42 @@
 // examples/nde/Train.cs.slang
-// Training kernel for the NDE example.
+// Two training kernels for the NDE example.
 //
-// Each thread picks a random sample from the pre-generated data buffer,
-// evaluates the flow's log-probability, and backpropagates the NLL gradient
-// (-1/N per sample) into the parameter gradient buffer.
+// trainMain    – MLE / NLL: pick a random sample from the data buffer,
+//                backpropagate -1/N.  Standard maximum-likelihood training.
 //
-// The three-kernel training loop:
-//   1. trainMain   – accumulate ∂L/∂params into gParamGrads  (this file)
-//   2. optimizeMain – Adam step on gParams using gParamGrads  (Optimize.cs.slang)
-//   3. evalMain     – render learned density to texture        (Infer.cs.slang)
+// trainKLMain  – KL divergence (Mueller et al. 2019, §3.1): draw x ~ q_θ from
+//                the current model via the inverse flow, look up unnormalized
+//                target f(x) from a flat luminance buffer, then backpropagate
+//                with importance weight  -f(x) / q_θ(x) / N.
+//
+//                ∇_θ KL(p‖q_θ) = E_{x~q_θ}[ -f(x)/q_θ(x) · ∇_θ log q_θ(x) ]
+//
+//                The global scale of f cancels in Adam, so f can be raw luminance
+//                (no explicit normalisation needed).
+//
+// Resources shared by both kernels:  gParams, gParamGrads.
+// Each kernel also has its own data source and cbuffer.
 
 import TSNN.CoopVec;
 import TSNN.LinearOps;
 import TSNN.Utils.Math;
 import Network;
 
-// gSamples holds a flat array of float2 data samples in [-tailBound, tailBound]²,
-// pre-generated on the CPU from the target 2-D PDF.
-ByteAddressBuffer    gSamples;
+// ─── Shared resources ─────────────────────────────────────────────────────────
+
 ByteAddressBuffer    gParams;
 RWByteAddressBuffer  gParamGrads;
+
+// ─── MLE kernel ───────────────────────────────────────────────────────────────
+
+ByteAddressBuffer gSamples;
 
 cbuffer CB
 {
     uint  gNumSamples;   // total samples in gSamples
     uint  gBatchSize;    // threads per dispatch
     uint  gCurrentStep;
-    float gLossScale;    // gradient pre-scale (undone in Optimize.cs); see below
+    float gLossScale;    // gradient pre-scale (undone in Optimize.cs)
 }
 
 [numthreads(64, 1, 1)]
@@ -36,29 +46,61 @@ void trainMain(uint3 tid : SV_DispatchThreadID)
     if (sampleIdx >= gBatchSize)
         return;
 
-    // Deterministic but varied sample selection
-    let rand   = pcg3d(uint3(gCurrentStep, sampleIdx, 0u));
+    let rand     = pcg3d(uint3(gCurrentStep, sampleIdx, 0u));
     uint dataIdx = rand.x % gNumSamples;
+    float2 x     = gSamples.LoadAligned<float2>(dataIdx * sizeof(float2));
 
-    // Load float2 sample from buffer (2 × float32 = 8 bytes per sample)
-    float2 x = gSamples.LoadAligned<float2>(dataIdx * sizeof(float2));
-
-    // NLL loss gradient: d(-log p(x)) / d(log p(x)) = -1/N.
-    // We scale by gLossScale so the per-sample contribution sits comfortably
-    // inside float16's normal range: -1/16384 ≈ 6.1e-5 is at the float16
-    // min-normal, so grad·activation would otherwise underflow to zero in the
-    // float16 gradient buffer.  Optimize.cs UNDOES this scale (in float32) before
-    // the optimiser step, so it only buys accumulation precision and does not
-    // change the update — use the debug counters to pick a value that neither
-    // underflows (too small) nor overflows the float16 accumulator (too large).
     float outputGrad = -gLossScale / float(max(1u, gBatchSize));
 
     var wBuf   = MatrixBiasBuffer(gParams);
     var wGrads = MatrixBiasBufferGrad(gParamGrads);
+    bwd_diff(forward)(DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), x, outputGrad);
+}
 
-    bwd_diff(forward)(
-        DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads),
-        x,
-        outputGrad
-    );
+// ─── KL kernel (Mueller et al. 2019, §3.1) ────────────────────────────────────
+
+// H×W float32 luminance, row-major.  Row 0 = top of image = x.y = -kDomain,
+// matching the convention used by evalMain and image_to_samples in main.py.
+ByteAddressBuffer gTargetBuf;
+
+cbuffer KLCB
+{
+    uint  gKLBatchSize;
+    uint  gKLCurrentStep;
+    float gKLLossScale;
+    uint  gTexWidth;
+    uint  gTexHeight;
+}
+
+[numthreads(64, 1, 1)]
+void trainKLMain(uint3 tid : SV_DispatchThreadID)
+{
+    uint idx = tid.x;
+    if (idx >= gKLBatchSize)
+        return;
+
+    // x ~ q_θ and log q_θ(x) in one inverse pass — avoids a separate forward() call.
+    let r    = pcg3d(uint3(gKLCurrentStep * 65521u + 1u, idx, 13u));
+    float2 u = uintToUnitFloat(r.xy);
+    float2 z = samplePrior(u);
+    let    s = sampleFlowLogProb(gParams, z);           // (x, log q_θ(x))
+    float2 x = clamp(s.x, float2(-kDomain), float2(kDomain));
+
+    // Map world coordinates to image pixel.
+    // image_to_samples maps image row 0 (top) → y = +kDomain, so high y is the
+    // top of the image.  Row 0 of gTargetBuf is the top of the PNG, so we must
+    // flip: row = (1 − uv.y) × H so that y=+1 → row 0 (top of buffer).
+    float2 uv = (x / kDomain) * 0.5f + 0.5f;                          // [0, 1]
+    uint   px = clamp(uint(uv.x * float(gTexWidth)),             0u, gTexWidth  - 1u);
+    uint   py = clamp(uint((1.0f - uv.y) * float(gTexHeight)),   0u, gTexHeight - 1u);
+    float  f  = gTargetBuf.LoadAligned<float>((py * gTexWidth + px) * sizeof(float));
+
+    float w = f / max(exp(s.logProb), 1e-10f);
+
+    // Score-function gradient:  -w/N  (eq. 4, Mueller et al. 2019)
+    float outputGrad = -w * gKLLossScale / float(max(1u, gKLBatchSize));
+
+    var wBuf   = MatrixBiasBuffer(gParams);
+    var wGrads = MatrixBiasBufferGrad(gParamGrads);
+    bwd_diff(forward)(DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), x, outputGrad);
 }
