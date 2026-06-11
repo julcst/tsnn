@@ -1,4 +1,4 @@
-import CoopVec;
+import TSNN.CoopVec;
 
 interface IActivation
 {

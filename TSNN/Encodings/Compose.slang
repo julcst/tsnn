@@ -1,7 +1,7 @@
 /// Helpers for assembling an MLP input CoopVec from heterogeneous encodings.
 /// All functions are differentiable with manually-registered backward passes.
 
-import CoopVec;
+import TSNN.CoopVec;
 
 [BackwardDerivative(SetCoop_bwd)]
 void SetCoop<let N : int, let M : int>(inout CoopVec<half, N> output, half[M] array, int offset)

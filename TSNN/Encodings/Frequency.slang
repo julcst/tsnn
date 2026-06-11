@@ -2,7 +2,7 @@
 /// Expands each input component into NUM_SCALES pairs of (sin, cos) at
 /// doubling frequencies starting at pi*x. Output size = NUM_SCALES * N * 2.
 
-import CoopVec;
+import TSNN.CoopVec;
 
 [Differentiable]
 CoopVec<T, NUM_SCALES * PARAMS_COUNT * 2> encodeFrequency<

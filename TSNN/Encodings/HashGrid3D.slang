@@ -1,8 +1,8 @@
 // Multi-level hash-grid encodings with trilinear / bilinear interpolation.
 
-import FeatureBuffer;
-import CoopVec;
-import Utils.Math;
+import TSNN.Encodings.FeatureBuffer;
+import TSNN.CoopVec;
+import TSNN.Utils.Math;
 
 uint hashGridIndex(uint3 cell, uint level, uint size)
 {

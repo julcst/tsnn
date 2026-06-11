@@ -1,5 +1,5 @@
-import CoopVec;
-import Utils.Math;
+import TSNN.CoopVec;
+import TSNN.Utils.Math;
 
 // A loss exposes both the scalar loss value (`eval`, for logging) and the
 // gradient of the loss w.r.t. the prediction (`deriv`, fed straight into the

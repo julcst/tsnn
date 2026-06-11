@@ -1,7 +1,7 @@
-import LinearOps;
-import CoopVec;
-import Math;
-import Activations;
+import TSNN.LinearOps;
+import TSNN.CoopVec;
+import TSNN.Utils.Math;
+import TSNN.Activations;
 
 // ─── SOTA weight initialisation ───────────────────────────────────────────────
 //

@@ -1,7 +1,7 @@
 // Differentiable linear layer: weight/bias buffer wrappers and LinearOp
 // forward + backward using the Vulkan cooperative vector extension.
 
-import CoopVec;
+import TSNN.CoopVec;
 
 // GPU buffer holding a flat weight matrix followed by a bias vector.
 // The Differential counterpart (MatrixBiasBufferGrad) collects gradients

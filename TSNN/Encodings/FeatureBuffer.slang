@@ -2,8 +2,8 @@
 // Provides loadVec (vector<T,N>) and loadCoop (CoopVec<T,N>) with correct
 // backward derivatives for gradient accumulation.
 
-import CoopVec;
-import Utils.Math;
+import TSNN.CoopVec;
+import TSNN.Utils.Math;
 
 // Coalesced init for a learnable feature table, stored as `T` (e.g. half): tiny
 // symmetric random values, the standard hash-grid scheme (instant-ngp uses
