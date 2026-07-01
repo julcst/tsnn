@@ -24,6 +24,7 @@ The framework is built around three manually-invoked fully-fused kernel invocati
 1. Training
 2. Optimization
 3. Inference
+
 The implementation of these kernels is highly problem-specific, so this repo only provides utility functions/classes.
 
 ## Examples
