@@ -1,9 +1,11 @@
 # TSNN
-Deep Learning framework for [Slang](https://github.com/shader-slang/slang), aimed to simplify neural texture compression, neural radiance caching, neural importance sampling, etc.
-Inspired by [tcnn](https://github.com/nvlabs/tiny-cuda-nn) and [RTXNS](https://github.com/NVIDIA-RTX/RTXNS).
+Deep Learning framework for [Slang](https://github.com/shader-slang/slang), aimed to simplify neural texture compression, neural radiance caching, neural importance sampling, etc., inspired by [tcnn](https://github.com/nvlabs/tiny-cuda-nn) and [RTXNS](https://github.com/NVIDIA-RTX/RTXNS).
+
 This library has no dependencies other than Slang and has explicit support for [Falcor](https://github.com/nvidiagameworks/falcor) and [slangpy](https://github.com/shader-slang/slangpy)
 
 ## Features
+
+### Modules
 * MLPs
 * Neural Spline Flows
 * Common loss functions (L1/L2, Relative L1/L2, Relative L2 Luminance)
@@ -13,7 +15,7 @@ This library has no dependencies other than Slang and has explicit support for [
 * Adam/AdamW
 
 ### Encodings
-* Hash Grid
+* Hash Grid 2D/3D
 * Spherical Harmonics
 * One Blob
 
