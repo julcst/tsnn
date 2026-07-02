@@ -78,14 +78,16 @@ struct SanitizeDebugCounter
             record(g[i], clip);
     }
 
-    // Atomically merge this thread's tally into the 4 × uint32 counter buffer.
-    void flush(RWByteAddressBuffer buffer)
+    // Atomically merge this thread's tally into a 4 × uint32 counter block at
+    // `byteOffset` (default 0).  Pass a non-zero offset to flush several
+    // independent counters (e.g. per-buffer) into one backing buffer.
+    void flush(RWByteAddressBuffer buffer, uint byteOffset = 0u)
     {
         uint prev;
-        buffer.InterlockedAdd(0u,  nonFinite, prev);
-        buffer.InterlockedAdd(4u,  clipped,   prev);
-        buffer.InterlockedAdd(8u,  zero,      prev);
-        buffer.InterlockedAdd(12u, total,     prev);
+        buffer.InterlockedAdd(byteOffset + 0u,  nonFinite, prev);
+        buffer.InterlockedAdd(byteOffset + 4u,  clipped,   prev);
+        buffer.InterlockedAdd(byteOffset + 8u,  zero,      prev);
+        buffer.InterlockedAdd(byteOffset + 12u, total,     prev);
     }
 }
 

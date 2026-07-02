@@ -61,6 +61,38 @@ void ComposeCoop_bwd<let N1 : int, let N2 : int>(inout DifferentialPair<half[N1]
 }
 
 
+// Concatenate three half[] arrays into one CoopVec in a SINGLE construction (fresh
+// output, not an inout accumulate).  Use this instead of chained SetCoop calls: the
+// inout-CoopVec form leaves the output differential's untouched lanes uninitialised on
+// this backend, and SetCoop_bwd reads them back as Inf/NaN, poisoning gradients that
+// flow back into a learnable input (e.g. hash-grid features).  ComposeEnc/ComposeCoop
+// build a fresh CoopVec whose backward writes every input differential at once.
+[BackwardDerivative(ComposeCoop3_bwd)]
+CoopVec<half, N1 + N2 + N3> ComposeCoop3<let N1 : int, let N2 : int, let N3 : int>(
+    half[N1] a1, half[N2] a2, half[N3] a3)
+{
+    CoopVec<half, N1 + N2 + N3> output;
+    [ForceUnroll] for (int i = 0; i < N1; i++) output[i] = a1[i];
+    [ForceUnroll] for (int i = 0; i < N2; i++) output[N1 + i] = a2[i];
+    [ForceUnroll] for (int i = 0; i < N3; i++) output[N1 + N2 + i] = a3[i];
+    return output;
+}
+
+void ComposeCoop3_bwd<let N1 : int, let N2 : int, let N3 : int>(
+    inout DifferentialPair<half[N1]> a1, inout DifferentialPair<half[N2]> a2,
+    inout DifferentialPair<half[N3]> a3, CoopVec<half, N1 + N2 + N3> dOutput)
+{
+    var dA1 = a1.d;
+    [ForceUnroll] for (int i = 0; i < N1; i++) dA1[i] += dOutput[i];
+    a1 = diffPair(a1.p, dA1);
+    var dA2 = a2.d;
+    [ForceUnroll] for (int i = 0; i < N2; i++) dA2[i] += dOutput[N1 + i];
+    a2 = diffPair(a2.p, dA2);
+    var dA3 = a3.d;
+    [ForceUnroll] for (int i = 0; i < N3; i++) dA3[i] += dOutput[N1 + N2 + i];
+    a3 = diffPair(a3.p, dA3);
+}
+
 // TODO: Make procedural
 [BackwardDerivative(ComposeEnc_bwd)]
 CoopVec<half, N1 + N2 + N3 + N4 + N5 + N6> ComposeEnc<int N1, int N2, int N3, int N4, int N5, int N6>(

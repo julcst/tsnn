@@ -42,12 +42,35 @@ vector<T, N> loadVec<T : __BuiltinFloatingPointType, int N>(FeatureBuffer b, int
     return b.buffer.LoadAligned<vector<T,N>>(index * N * sizeof(T));
 }
 
+// CAS-based float atomic add — works without VK_EXT_shader_atomic_float, which
+// InterlockedAddF32 silently relies on (and no-ops to zero where unsupported).
+void atomicAddF32(RWByteAddressBuffer buf, uint byteAddr, float value)
+{
+    uint expected = buf.Load<uint>(byteAddr);
+    for (;;)
+    {
+        float updated = asfloat(expected) + value;
+        uint prev;
+        buf.InterlockedCompareExchange(byteAddr, expected, asuint(updated), prev);
+        if (prev == expected) break;
+        expected = prev;
+    }
+}
+
 void loadVec_bwd<T : __BuiltinFloatingPointType, int N>(DifferentialPtrPair<FeatureBuffer> b, int index, vector<T, N> dOut)
 {
-    float o;
-    // NOTE: InterlockedAdd is only well supported for F32
+    // Scrub non-finite per-element BEFORE the atomic add: the score-function /
+    // flow backward occasionally produces an Inf/NaN feature gradient for a high-
+    // variance sample, and a single non-finite atomicAdd poisons that table entry
+    // permanently (Inf+x = Inf).  Dropping the bad sample lets the finite ones
+    // through, matching the optimiser's sanitize() philosophy.
     [ForceUnroll]
-    for (int i = 0; i < N; ++i) b.d.buffer.InterlockedAddF32((index * N + i) * sizeof(float), dOut[i].toFloat(), o);
+    for (int i = 0; i < N; ++i)
+    {
+        let g = dOut[i].toFloat();
+        if (isfinite(g))
+            atomicAddF32(b.d.buffer, (index * N + i) * sizeof(float), g);
+    }
     // TODO: Use faster _NvInterlockedAddF16x2 when available
 }
 
