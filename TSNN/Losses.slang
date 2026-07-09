@@ -99,6 +99,26 @@ struct RelativeL2<T : __BuiltinFloatingPointType, let K : int> : ILoss<T, K>
     }
 };
 
+// ─── Relative-L1 (per channel) ────────────────────────────────────────────────
+// L1 normalised by the prediction's own magnitude — like RelativeL2 but with a
+// linear (not quadratic) penalty, so it is less sensitive to outliers while
+// still equalising bright and dark regions.
+//   eval  = scale·|p − t| / (|p| + ε)     deriv = scale·sign(p − t) / (|p| + ε)
+struct RelativeL1<T : __BuiltinFloatingPointType, let K : int> : ILoss<T, K>
+{
+    static CoopVec<T, K> eval(CoopVec<T, K> target, CoopVec<T, K> predicted, CoopVec<T, K> scale)
+    {
+        let denom = abs(predicted) + CoopVec<T, K>(T(1e-2));
+        return scale * abs(predicted - target) / denom;
+    }
+
+    static CoopVec<T, K> deriv(CoopVec<T, K> target, CoopVec<T, K> predicted, CoopVec<T, K> scale)
+    {
+        let denom = abs(predicted) + CoopVec<T, K>(T(1e-2));
+        return scale * copysign(CoopVec<T, K>(T(1)), predicted - target) / denom;
+    }
+};
+
 // ─── Relative-L2 normalised by luminance (RGB only) ───────────────────────────
 // Like RelativeL2 but the denominator is a single shared luminance², so the hue
 // is not distorted by per-channel normalisation — the standard choice for
