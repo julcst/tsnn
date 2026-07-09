@@ -20,6 +20,7 @@ cbuffer CB
     uint gBatchSize;
     uint gCurrentStep;
     uint gFrameIndex;
+    float gLossScale;
 }
 
 [numthreads(64, 1, 1)]
@@ -39,7 +40,10 @@ void trainMain(uint3 tid: SV_DispatchThreadID)
 
     let pred = forward(gEncodingParams, gParams, uv);
 
-    let scale = CoopVec<half, 3>(half(1.0f / float(max(1u, gBatchSize))));
+    // Pre-scale by gLossScale before the fp16 gradient atomics (weight grads,
+    // and backprop through them) so per-sample contributions don't land in
+    // fp16's subnormal range; Optimize.cs.slang's Adam divides it back out.
+    let scale = CoopVec<half, 3>(half(gLossScale / float(max(1u, gBatchSize))));
     let outputGrad = RelativeL2Luminance<half>::deriv(targetVec, pred, scale);
 
     var encBuf = FeatureBuffer(gEncodingParams);

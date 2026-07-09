@@ -21,11 +21,11 @@ KL mode (--mode kl):
 Both modes produce density .exr fields and Jensen-Shannon divergence logs.
 
 Usage:
-  python main.py                                          # MLE, Gaussian mixture
-  python main.py --image einstein.png                     # MLE, image target
-  python main.py --image einstein.png --mode kl           # KL, image target
-  python main.py --image einstein.png --mode kl --flow rqs --prior uniform
-  python main.py --image einstein.png --steps 10000 --lr 3e-4
+  python main.py                                             # MLE, Gaussian mixture
+  python main.py --image ../einstein.png                     # MLE, image target
+  python main.py --image ../einstein.png --mode kl           # KL, image target
+  python main.py --image ../einstein.png --mode kl --flow rqs --prior uniform
+  python main.py --image ../einstein.png --steps 10000 --lr 3e-4
 """
 
 import argparse

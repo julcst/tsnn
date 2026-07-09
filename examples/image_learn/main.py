@@ -25,10 +25,11 @@ OUTPUT_SIZE = 3
 HIDDEN_LAYERS = 4
 TRANSITIONS = HIDDEN_LAYERS + 1
 
-ADAM_BETA1 = 0.9
-ADAM_BETA2 = 0.999
-ADAM_EPSILON = 1e-8
-LOSS_SCALE = 1.0
+# Weight gradients are accumulated via fp16 hardware coopvec atomics
+# (CoopVecComponentType::Float16 in MLP.slang); pre-scaling by LOSS_SCALE
+# before backward keeps them out of fp16's subnormal range. Adam's
+# invLossScale divides it back out during the update. See benchmark.py.
+LOSS_SCALE = 1024.0
 
 BATCH_SIZE = 1 << 14  # 16 384 pixels per step
 STEPS = 5_000
@@ -71,24 +72,25 @@ MOMENT_BYTES = PARAM_COUNT * 4  # float32
 ENC_GRAD_BYTES = _align4(ENC_PARAM_COUNT * 4)
 ENC_MOMENT_BYTES = _align4(ENC_PARAM_COUNT * 4)
 
+# Reset/optimize dispatch thread count, scaled to the (much larger) encoding
+# param count instead of a small fixed size -- mirrors SlangNRC.cpp's
+# kOptimizeDispatchThreads.
+DISPATCH_THREAD_COUNT = (min(1 << 19, ENC_PARAM_COUNT) + 255) // 256 * 256
+
 
 # ─── Target image helpers ─────────────────────────────────────────────────────
 
-
-def make_procedural(res: int) -> np.ndarray:
-    y, x = np.mgrid[0:res, 0:res] / (res - 1.0)
-    r = np.sqrt((x - 0.5) ** 2 + (y - 0.5) ** 2)
-    theta = np.arctan2(y - 0.5, x - 0.5) / (2 * math.pi) + 0.5
-    R = np.clip(np.sin(theta * math.pi * 2) * 0.5 + 0.5, 0, 1)
-    G = np.clip(np.cos(theta * math.pi * 2) * 0.5 + 0.5, 0, 1)
-    B = np.clip(1.0 - r, 0, 1)
-    return np.stack([R, G, B], axis=-1).astype(np.float32)  # [H, W, 3]
+# Shared across examples/image_learn and examples/nde.
+DEFAULT_IMAGE = Path(__file__).parent.parent / "einstein.png"
 
 
 def load_image(path: str, res: int) -> np.ndarray:
-    # Use slangpy.Bitmap to load and convert images (avoids Pillow dependency)
-    bmp = spy.Bitmap(path).convert(pixel_format=spy.Bitmap.PixelFormat.rgb)
-    return np.array(bmp, copy=False)
+    bmp = spy.Bitmap(str(path)).convert(
+        pixel_format=spy.Bitmap.PixelFormat.rgb,
+        component_type=spy.Bitmap.ComponentType.float32,
+        srgb_gamma=False,
+    )
+    return np.array(bmp.resample(res, res), copy=False)
 
 
 # ─── Buffer utilities ─────────────────────────────────────────────────────────
@@ -130,10 +132,10 @@ class ImageLearner:
 
         # Load and upload target image
         self.target_tex = upload_texture(device, target)
-        # spy.tev.show(self.target_tex, name="target")
 
         # GPU buffers
         self.params = create_buffer(device, PARAM_BYTES, is_rw=True)
+        self.params_master = create_buffer(device, MOMENT_BYTES, is_rw=True)  # float32, same size as moments
         self.param_grads = create_buffer(device, PARAM_BYTES, is_rw=True)
         self.moments1 = create_buffer(device, MOMENT_BYTES, is_rw=True)
         self.moments2 = create_buffer(device, MOMENT_BYTES, is_rw=True)
@@ -142,7 +144,6 @@ class ImageLearner:
         self.enc_moments1 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
         self.enc_moments2 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
         self.output_tex = create_texture(device, self.W, self.H)
-        # spy.tev.show(self.output_tex, name="output")
 
         # Load compute kernels
         self.reset_kernel = device.create_compute_kernel(
@@ -171,11 +172,12 @@ class ImageLearner:
         )
 
         # Reset parameters (weights + hash grid). Adam moments are just zeroed.
-        dispatch_count = 256 * 8
+        dispatch_count = DISPATCH_THREAD_COUNT
         self.reset_kernel.dispatch(
             thread_count=[dispatch_count, 1, 1],
             vars={
                 "gParams": self.params,
+                "gParamsMaster": self.params_master,
                 "gEncodingParams": self.enc_params,
                 "CB": {
                     "gLearningRate": LR,
@@ -210,16 +212,18 @@ class ImageLearner:
                     "gBatchSize": BATCH_SIZE,
                     "gCurrentStep": step,
                     "gFrameIndex": step,
+                    "gLossScale": LOSS_SCALE,
                 },
             },
         )
 
     def optimize_step(self, step: int, lr: float):
-        dispatch_count = 256 * 8
+        dispatch_count = DISPATCH_THREAD_COUNT
         self.optimize_kernel.dispatch(
             thread_count=[dispatch_count, 1, 1],
             vars={
                 "gParams": self.params,
+                "gParamsMaster": self.params_master,
                 "gParamGrads": self.param_grads,
                 "gMoments1": self.moments1,
                 "gMoments2": self.moments2,
@@ -231,6 +235,7 @@ class ImageLearner:
                     "gLearningRate": lr,
                     "gCurrentStep": float(step),
                     "gDispatchThreadCount": dispatch_count,
+                    "gLossScale": LOSS_SCALE,
                 },
             },
         )
@@ -245,7 +250,6 @@ class ImageLearner:
                 "gEncodingParams": self.enc_params,
             },
         )
-        # spy.tev.show(self.output_tex, name="output2")
         return self.output_tex.to_numpy().view(np.float32)[..., :3]
 
     def mse(self, pred: np.ndarray, target: np.ndarray) -> float:
@@ -278,17 +282,15 @@ def train(target: np.ndarray, device, steps: int, lr: float):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", default=None, help="Input image path")
+    parser.add_argument("--image", default=str(DEFAULT_IMAGE), help="Input image path")
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--res", type=int, default=RESOLUTION)
     parser.add_argument("--out", default="result.exr")
     args = parser.parse_args()
 
-    target = (
-        load_image(args.image, args.res) if args.image else make_procedural(args.res)
-    )
-    print(f"Target: {target.shape[1]}x{target.shape[0]}")
+    target = load_image(args.image, args.res)
+    print(f"Target: {args.image} ({target.shape[1]}x{target.shape[0]})")
 
     device = spy.create_device(
         include_paths=[
