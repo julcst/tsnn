@@ -9,6 +9,9 @@ This library only depends on Slang and has explicit support for [Falcor](https:/
 * **Hardware Acceleration**: Natively uses Cooperative Vector Operations
 * **Flexibility**: Slangs Auto-Diff system allows for arbitrary architectures and efficiently calculates gradients using Source Code Transformation
 
+> [!WARNING]  
+> Does not work for slangpy >= 0.43, because Slang v2026.12 makes CoopVec differentiable themselves, recent Slang also has [their own neural network module](https://github.com/shader-slang/slang/tree/master/source/standard-modules/neural).
+
 ## Features
 
 ### Modules
