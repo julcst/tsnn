@@ -14,8 +14,7 @@
 //   pqForward<K>(x, CoopVec<half,2K+1>, tail)           [Differentiable]
 //   pqInverse<K>(y, CoopVec<half,2K+1>, tail)
 //
-// Packed parameter order is [W(K) | V(K+1)].  Decode is inlined in each entry
-// point for the same autodiff-miscompile reason documented in RQS.slang.
+// Packed parameter order is [W(K) | V(K+1)].
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -29,12 +28,7 @@ FlowStep pqForward<let K : uint>(float x, float W[K], float V[K + 1u], no_diff f
 
     // widths ω via softmax(W); Σ ω = 1
     float om[K];
-    float maxW = W[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, W[i]);
-    float sumW = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { om[i] = exp(W[i] - maxW); sumW += om[i]; }
-    float invW = 1.0f / sumW;
-    [ForceUnroll] for (uint i = 0; i < K; i++) om[i] *= invW;
+    softmax(W, om);
 
     // vertices: exp(V), normalised so ∫ pdf = Σ ω·(v_i+v_{i+1})/2 = 1
     float ev[K + 1u];
@@ -48,14 +42,12 @@ FlowStep pqForward<let K : uint>(float x, float W[K], float V[K + 1u], no_diff f
     [ForceUnroll] for (uint i = 0; i < K + 1u; i++) v[i] = ev[i] * invD;
 
     // cumulative width knots Ω and cumulative area (CDF at knots) cumA
-    float cumOm[K + 1u];
-    float cumA[K + 1u];
-    cumOm[0] = 0.0f;  cumA[0] = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++)
-    {
-        cumOm[i + 1] = cumOm[i] + om[i];
-        cumA[i + 1]  = cumA[i]  + 0.5f * (v[i] + v[i + 1]) * om[i];
-    }
+    float cumOm[int(K) + 1];
+    float cumA[int(K) + 1];
+    cumulativeSum(om, 0.0f, 1.0f, cumOm);
+    float areas[K];
+    [ForceUnroll] for (uint i = 0; i < K; i++) areas[i] = 0.5f * (v[i] + v[i + 1]) * om[i];
+    cumulativeSum(areas, 0.0f, 1.0f, cumA);
 
     float span = 2.0f * tail;
     float u    = (x + tail) / span;     // ∈ [0,1)
@@ -85,12 +77,7 @@ FlowStep pqInverse<let K : uint>(float y, float W[K], float V[K + 1u], float tai
     if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float om[K];
-    float maxW = W[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, W[i]);
-    float sumW = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { om[i] = exp(W[i] - maxW); sumW += om[i]; }
-    float invW = 1.0f / sumW;
-    [ForceUnroll] for (uint i = 0; i < K; i++) om[i] *= invW;
+    softmax(W, om);
 
     float ev[K + 1u];
     float maxV = V[0];
@@ -102,14 +89,12 @@ FlowStep pqInverse<let K : uint>(float y, float W[K], float V[K + 1u], float tai
     float v[K + 1u];
     [ForceUnroll] for (uint i = 0; i < K + 1u; i++) v[i] = ev[i] * invD;
 
-    float cumOm[K + 1u];
-    float cumA[K + 1u];
-    cumOm[0] = 0.0f;  cumA[0] = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++)
-    {
-        cumOm[i + 1] = cumOm[i] + om[i];
-        cumA[i + 1]  = cumA[i]  + 0.5f * (v[i] + v[i + 1]) * om[i];
-    }
+    float cumOm[int(K) + 1];
+    float cumA[int(K) + 1];
+    cumulativeSum(om, 0.0f, 1.0f, cumOm);
+    float areas[K];
+    [ForceUnroll] for (uint i = 0; i < K; i++) areas[i] = 0.5f * (v[i] + v[i + 1]) * om[i];
+    cumulativeSum(areas, 0.0f, 1.0f, cumA);
 
     float span = 2.0f * tail;
     float s    = (y + tail) / span;     // CDF value ∈ [0,1)

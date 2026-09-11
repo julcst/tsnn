@@ -39,12 +39,8 @@
 // `static constexpr` bools) — branches inside one body, not a helper-function boundary, so
 // they do not trip the inlining constraint below.
 //
-// NOTE: mirrors RQS.slang/CircularRQS.slang's inlining discipline exactly — the spline
-// decode (softmax, derivative construction, cumsum, bin search) is kept inlined in EACH
-// entry point. Factoring it into a helper that returns an array/struct through the autodiff
-// path miscompiles on this Slang/Vulkan backend (RQS.slang:24-28, CircularRQS.slang:35-37).
-// The duplication between urqsLogPdf/urqsInverse/urqsCdf is deliberate — do not refactor it
-// away.
+// Shared softmax and cumulative-sum array operations are provided by TSNN.CoopVec.
+// The remaining decode work stays local to each entry point.
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -81,20 +77,15 @@ float urqsLogPdf<let K : uint>(no_diff float eps, float h[K], float d[K + 1u],
     // heights: softmax + min-height floor. Sums to exactly 1 (K*minH + (1-K*minH)*1), so
     // cumsum(p) is a genuine CDF from 0 to 1.
     float p[K];
-    float maxH = h[0];
-    [ForceUnroll] for (uint i = 1u; i < K; ++i) maxH = max(maxH, h[i]);
-    float sumH = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) { p[i] = exp(h[i] - maxH); sumH += p[i]; }
-    float invSumH = 1.0f / sumH;
+    softmax(h, p);
     [ForceUnroll] for (uint i = 0u; i < K; ++i)
-        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i] * invSumH;
+        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i];
 
     float delta[K];
     [ForceUnroll] for (uint i = 0u; i < K; ++i) delta[i] = p[i] * float(K);
 
-    float cumH[K + 1u];
-    cumH[0] = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) cumH[i + 1u] = cumH[i] + p[i];
+    float cumH[int(K) + 1];
+    cumulativeSum(p, 0.0f, 1.0f, cumH);
 
     float dd[K + 1u];
     if (learnedDeriv)
@@ -153,20 +144,15 @@ float urqsInverse<let K : uint>(float xi, float h[K], float d[K + 1u],
                                 bool circular, bool learnedDeriv)
 {
     float p[K];
-    float maxH = h[0];
-    [ForceUnroll] for (uint i = 1u; i < K; ++i) maxH = max(maxH, h[i]);
-    float sumH = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) { p[i] = exp(h[i] - maxH); sumH += p[i]; }
-    float invSumH = 1.0f / sumH;
+    softmax(h, p);
     [ForceUnroll] for (uint i = 0u; i < K; ++i)
-        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i] * invSumH;
+        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i];
 
     float delta[K];
     [ForceUnroll] for (uint i = 0u; i < K; ++i) delta[i] = p[i] * float(K);
 
-    float cumH[K + 1u];
-    cumH[0] = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) cumH[i + 1u] = cumH[i] + p[i];
+    float cumH[int(K) + 1];
+    cumulativeSum(p, 0.0f, 1.0f, cumH);
     cumH[K] = 1.0f;  // exact, guards fp drift from the running sum
 
     float dd[K + 1u];
@@ -232,20 +218,15 @@ float urqsCdf<let K : uint>(no_diff float eps, float h[K], float d[K + 1u],
                             no_diff bool circular, no_diff bool learnedDeriv)
 {
     float p[K];
-    float maxH = h[0];
-    [ForceUnroll] for (uint i = 1u; i < K; ++i) maxH = max(maxH, h[i]);
-    float sumH = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) { p[i] = exp(h[i] - maxH); sumH += p[i]; }
-    float invSumH = 1.0f / sumH;
+    softmax(h, p);
     [ForceUnroll] for (uint i = 0u; i < K; ++i)
-        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i] * invSumH;
+        p[i] = kURQSMinBinHeight + (1.0f - kURQSMinBinHeight * float(K)) * p[i];
 
     float delta[K];
     [ForceUnroll] for (uint i = 0u; i < K; ++i) delta[i] = p[i] * float(K);
 
-    float cumH[K + 1u];
-    cumH[0] = 0.0f;
-    [ForceUnroll] for (uint i = 0u; i < K; ++i) cumH[i + 1u] = cumH[i] + p[i];
+    float cumH[int(K) + 1];
+    cumulativeSum(p, 0.0f, 1.0f, cumH);
 
     float dd[K + 1u];
     if (learnedDeriv)

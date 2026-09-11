@@ -7,9 +7,10 @@
 // Layout (each section sorted alphabetically):
 //   1. IDifferentiable extension
 //   2. Element-wise math primitives (abs, copysign)
-//   3. Activations — each forward co-located with its backward
-//   4. Builtin backward (exp)
-//   5. Float array / vector ↔ CoopVec conversions
+//   3. Array math primitives (softmax, cumulative sum)
+//   4. Activations — each forward co-located with its backward
+//   5. Builtin backward (exp)
+//   6. Float array / vector ↔ CoopVec conversions
 
 // Extend the built-in CoopVec<T, K> type to participate in Slang autodiff.
 extension<T : __BuiltinFloatingPointType, let K : int> CoopVec<T, K> : IDifferentiable
@@ -33,6 +34,44 @@ CoopVec<T, K> copysign<T : __BuiltinFloatingPointType, let K : int>(CoopVec<T, K
     for (int i = 0; i < K; ++i)
         mag[i] = copysign(mag[i], sgn[i]);
     return mag;
+}
+
+// ─── Array math primitives ───────────────────────────────────────────────────
+
+// Numerically stable softmax over a compile-time-sized float array.
+// Array outputs, rather than a returned aggregate, remain compatible with the
+// differentiable spline decode paths on the Slang/Vulkan backend.
+[Differentiable]
+void softmax<let N : int>(float logits[N], out float probabilities[N])
+{
+    float maximum = logits[0];
+    [ForceUnroll]
+    for (int i = 1; i < N; ++i)
+        maximum = max(maximum, logits[i]);
+
+    float sum = 0.0f;
+    [ForceUnroll]
+    for (int i = 0; i < N; ++i)
+    {
+        probabilities[i] = exp(logits[i] - maximum);
+        sum += probabilities[i];
+    }
+
+    float inverseSum = 1.0f / sum;
+    [ForceUnroll]
+    for (int i = 0; i < N; ++i)
+        probabilities[i] *= inverseSum;
+}
+
+// Inclusive cumulative sum with an explicit initial value and element scale:
+// result[0] = initialValue; result[i + 1] = result[i] + scale * values[i].
+[Differentiable]
+void cumulativeSum<let N : int>(float values[N], float initialValue, float scale, out float result[N + 1])
+{
+    result[0] = initialValue;
+    [ForceUnroll]
+    for (int i = 0; i < N; ++i)
+        result[i + 1] = result[i] + scale * values[i];
 }
 
 // ─── Activations ──────────────────────────────────────────────────────────────

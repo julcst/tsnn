@@ -23,9 +23,8 @@
 //
 // NOTE: x/y (the transformed coordinate) is *differentiable*, not no_diff: in a
 // stacked coupling flow it is the output of previous layers, so the Jacobian
-// must chain through it.  The spline decode (softmax/softplus/cumulative) is
-// kept inlined in each entry point — factoring it into helper functions that
-// return arrays/structs through the autodiff path miscompiles here.
+// must chain through it. Shared array operations live in TSNN.CoopVec; they use
+// output-array parameters, which remain compatible with this autodiff path.
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -60,33 +59,21 @@ FlowStep rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 1
 
     // widths: softmax + min-width floor, scaled to span 2·tail
     float widths[K];
-    float maxW = w[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, w[i]);
-    float sumW = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { widths[i] = exp(w[i] - maxW); sumW += widths[i]; }
-    float invSumW = 1.0f / sumW;
+    softmax(w, widths);
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        widths[i] = kRQSMinBinWidth + (1.0f - kRQSMinBinWidth * float(K)) * widths[i] * invSumW;
+        widths[i] = kRQSMinBinWidth + (1.0f - kRQSMinBinWidth * float(K)) * widths[i];
 
     // heights: softmax + min-height floor
     float heights[K];
-    float maxH = h[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxH = max(maxH, h[i]);
-    float sumH = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { heights[i] = exp(h[i] - maxH); sumH += heights[i]; }
-    float invSumH = 1.0f / sumH;
+    softmax(h, heights);
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        heights[i] = kRQSMinBinHeight + (1.0f - kRQSMinBinHeight * float(K)) * heights[i] * invSumH;
+        heights[i] = kRQSMinBinHeight + (1.0f - kRQSMinBinHeight * float(K)) * heights[i];
 
     // cumulative knot positions over [-tail, tail]
-    float cumW[K + 1u];
-    float cumH[K + 1u];
-    cumW[0] = -tail;  cumH[0] = -tail;
-    [ForceUnroll] for (uint i = 0; i < K; i++)
-    {
-        cumW[i + 1] = cumW[i] + widths[i]  * (2.0f * tail);
-        cumH[i + 1] = cumH[i] + heights[i] * (2.0f * tail);
-    }
+    float cumW[int(K) + 1];
+    float cumH[int(K) + 1];
+    cumulativeSum(widths, -tail, 2.0f * tail, cumW);
+    cumulativeSum(heights, -tail, 2.0f * tail, cumH);
     cumW[K] = tail;  cumH[K] = tail;
     [ForceUnroll] for (uint i = 0; i < K; i++)
     {
@@ -136,31 +123,19 @@ FlowStep rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 1
     if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float widths[K];
-    float maxW = w[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, w[i]);
-    float sumW = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { widths[i] = exp(w[i] - maxW); sumW += widths[i]; }
-    float invSumW = 1.0f / sumW;
+    softmax(w, widths);
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        widths[i] = kRQSMinBinWidth + (1.0f - kRQSMinBinWidth * float(K)) * widths[i] * invSumW;
+        widths[i] = kRQSMinBinWidth + (1.0f - kRQSMinBinWidth * float(K)) * widths[i];
 
     float heights[K];
-    float maxH = h[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxH = max(maxH, h[i]);
-    float sumH = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { heights[i] = exp(h[i] - maxH); sumH += heights[i]; }
-    float invSumH = 1.0f / sumH;
+    softmax(h, heights);
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        heights[i] = kRQSMinBinHeight + (1.0f - kRQSMinBinHeight * float(K)) * heights[i] * invSumH;
+        heights[i] = kRQSMinBinHeight + (1.0f - kRQSMinBinHeight * float(K)) * heights[i];
 
-    float cumW[K + 1u];
-    float cumH[K + 1u];
-    cumW[0] = -tail;  cumH[0] = -tail;
-    [ForceUnroll] for (uint i = 0; i < K; i++)
-    {
-        cumW[i + 1] = cumW[i] + widths[i]  * (2.0f * tail);
-        cumH[i + 1] = cumH[i] + heights[i] * (2.0f * tail);
-    }
+    float cumW[int(K) + 1];
+    float cumH[int(K) + 1];
+    cumulativeSum(widths, -tail, 2.0f * tail, cumW);
+    cumulativeSum(heights, -tail, 2.0f * tail, cumH);
     cumW[K] = tail;  cumH[K] = tail;
     [ForceUnroll] for (uint i = 0; i < K; i++)
     {

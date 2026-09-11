@@ -13,8 +13,7 @@
 //   plForward<K>(x, CoopVec<half,K>, tail)      [Differentiable]
 //   plInverse<K>(y, CoopVec<half,K>, tail)
 //
-// Packed parameter order is [q(K)].  Decode is inlined in each entry point for
-// the same autodiff-miscompile reason documented in RQS.slang.
+// Packed parameter order is [q(K)].
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -28,12 +27,7 @@ FlowStep plForward<let K : uint>(float x, float q[K], no_diff float tail)
 
     // bin probabilities via numerically-stable softmax
     float p[K];
-    float maxQ = q[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxQ = max(maxQ, q[i]);
-    float sum = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { p[i] = exp(q[i] - maxQ); sum += p[i]; }
-    float invSum = 1.0f / sum;
-    [ForceUnroll] for (uint i = 0; i < K; i++) p[i] = p[i] * invSum;
+    softmax(q, p);
 
     float span = 2.0f * tail;
     float w    = span / float(K);
@@ -41,8 +35,9 @@ FlowStep plForward<let K : uint>(float x, float q[K], no_diff float tail)
     // locate bin and its cumulative probability at the left knot
     float u   = (x + tail) / span;      // ∈ [0,1)
     int   bin = min(int(u * float(K)), int(K) - 1);
-    float cumP = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) cumP += (int(i) < bin) ? p[i] : 0.0f;
+    float cumulative[int(K) + 1];
+    cumulativeSum(p, 0.0f, 1.0f, cumulative);
+    float cumP = cumulative[bin];
 
     float pb    = p[bin];
     float theta = clamp((x - (-tail + float(bin) * w)) / w, 0.0f, 1.0f);
@@ -61,12 +56,7 @@ FlowStep plInverse<let K : uint>(float y, float q[K], float tail)
     if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float p[K];
-    float maxQ = q[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxQ = max(maxQ, q[i]);
-    float sum = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) { p[i] = exp(q[i] - maxQ); sum += p[i]; }
-    float invSum = 1.0f / sum;
-    [ForceUnroll] for (uint i = 0; i < K; i++) p[i] = p[i] * invSum;
+    softmax(q, p);
 
     float span = 2.0f * tail;
     float w    = span / float(K);
@@ -74,18 +64,15 @@ FlowStep plInverse<let K : uint>(float y, float q[K], float tail)
     float s = (y + tail) / span;        // CDF value ∈ [0,1)
 
     // locate bin: largest b with cumulative probability ≤ s
-    float cum = 0.0f;
+    float cumulative[int(K) + 1];
+    cumulativeSum(p, 0.0f, 1.0f, cumulative);
     int   bin = 0;
     [ForceUnroll] for (uint i = 0; i < K; i++)
-    {
-        bin = (s >= cum + p[i]) ? int(i + 1) : bin;
-        cum += p[i];
-    }
+        bin = (s >= cumulative[i + 1]) ? int(i + 1) : bin;
     bin = min(bin, int(K) - 1);
 
     // cumulative probability at the chosen bin's left knot
-    float cumP = 0.0f;
-    [ForceUnroll] for (uint i = 0; i < K; i++) cumP += (int(i) < bin) ? p[i] : 0.0f;
+    float cumP = cumulative[bin];
 
     float pb    = p[bin];
     float theta = clamp((s - cumP) / max(pb, 1e-30f), 0.0f, 1.0f);
