@@ -26,7 +26,7 @@ dependencies = [
 requires-dist = [
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pillow", specifier = ">=11.0.0" },
-    { name = "slangpy", specifier = ">=0.42.0" },
+    { name = "slangpy", specifier = ">=0.42.0,<0.43" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 

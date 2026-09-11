@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["slangpy", "numpy", "tqdm"]
+# dependencies = ["slangpy>=0.42,<0.43", "numpy", "tqdm"]
 # ///
 """Benchmark harness for the TSNN (Slang/slangpy) image-learning example.
 Trains the same hash-grid + MLP configuration as benchmark_tcnn.py and dumps a

@@ -4,8 +4,4 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "numpy>=2.4.6",
-    "slangpy>=0.42.0",
-    "tqdm>=4.67.3",
-]
+dependencies = ["numpy>=2.4.6", "slangpy>=0.43.0,<0.43", "tqdm>=4.67.3"]

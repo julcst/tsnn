@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = ["slangpy", "numpy", "tqdm"]
+# dependencies = ["slangpy>=0.42,<0.43", "numpy", "tqdm"]
 # ///
 
 import argparse
