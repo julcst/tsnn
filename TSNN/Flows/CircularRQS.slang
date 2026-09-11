@@ -42,9 +42,19 @@ import TSNN.Flows.Bijection;
 static const float kCRQSMinBinWidth   = 1e-3f;
 static const float kCRQSMinBinHeight  = 1e-3f;
 static const float kCRQSMinDerivative = 1e-3f;
+static const float kCRQSDerivativeUnnorm = 0.5413f;
+static const float kCRQSMaxRaw = 15.0f;
 
 [Differentiable]
 float crqsSoftplus(float x) { return x > 20.0f ? x : log(1.0f + exp(x)); }
+
+[Differentiable]
+float crqsDerivative(float raw)
+{
+    // The conditioner output layer is zero-initialised. Offset its derivative logits so
+    // zero decodes to slope 1; uniform widths/heights then produce the exact identity map.
+    return kCRQSMinDerivative + crqsSoftplus(raw + kCRQSDerivativeUnnorm);
+}
 
 // Wrap x into [-tail, tail) — identifies x = tail with x = -tail (same circle point).
 // Measure-preserving (derivative 1 a.e.), so it never contributes to logAbsDet.
@@ -107,7 +117,7 @@ FlowStep crqsForward<let K : uint>(float xIn, float w[K], float h[K], float d[K]
     // (same value) instead of RQS.slang's fixed identity-slope boundary.
     float deriv[K + 1u];
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        deriv[i] = kCRQSMinDerivative + crqsSoftplus(d[i]);
+        deriv[i] = crqsDerivative(d[i]);
     deriv[K] = deriv[0];
 
     int bin = 0;
@@ -126,12 +136,13 @@ FlowStep crqsForward<let K : uint>(float xIn, float w[K], float h[K], float d[K]
     float t1mt   = theta * (1.0f - theta);
     float num    = bh * (delta * theta * theta + dk * t1mt);
     float denom  = delta + (dk + dk1 - 2.0f * delta) * t1mt;
-    float y      = ch + num / denom;
+    float safeDenom = max(denom, 1e-20f);
+    float y      = ch + num / safeDenom;
 
     float dnumer = delta * delta * (
         dk1 * theta * theta + 2.0f * delta * t1mt + dk * (1.0f - theta) * (1.0f - theta)
     );
-    float logDet = log(dnumer) - 2.0f * log(abs(denom));
+    float logDet = log(max(dnumer, 1e-30f)) - 2.0f * log(safeDenom);
 
     FlowStep r = { y, logDet };
     return r;
@@ -178,7 +189,7 @@ FlowStep crqsInverse<let K : uint>(float yIn, float w[K], float h[K], float d[K]
 
     float deriv[K + 1u];
     [ForceUnroll] for (uint i = 0; i < K; i++)
-        deriv[i] = kCRQSMinDerivative + crqsSoftplus(d[i]);
+        deriv[i] = crqsDerivative(d[i]);
     deriv[K] = deriv[0];
 
     int bin = 0;
@@ -208,7 +219,8 @@ FlowStep crqsInverse<let K : uint>(float yIn, float w[K], float h[K], float d[K]
     float dnumer = delta * delta * (
         dk1 * theta * theta + 2.0f * delta * t1mt + dk * (1.0f - theta) * (1.0f - theta)
     );
-    float logDet = log(dnumer) - 2.0f * log(abs(denom));
+    float safeDenom = max(denom, 1e-20f);
+    float logDet = log(max(dnumer, 1e-30f)) - 2.0f * log(safeDenom);
 
     FlowStep r = { x, -logDet };
     return r;
@@ -221,9 +233,9 @@ FlowStep crqsForward<let K : uint>(float x, CoopVec<half, 3u * K> cv, no_diff fl
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) w[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) h[i] = arr[K + i];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) d[i] = arr[2u * K + i];
+    [ForceUnroll] for (uint i = 0u; i < K; i++) w[i] = clamp(arr[i], -kCRQSMaxRaw, kCRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K; i++) h[i] = clamp(arr[K + i], -kCRQSMaxRaw, kCRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K; i++) d[i] = clamp(arr[2u * K + i], -kCRQSMaxRaw, kCRQSMaxRaw);
     return crqsForward<K>(x, w, h, d, tail);
 }
 
@@ -231,8 +243,8 @@ FlowStep crqsInverse<let K : uint>(float y, CoopVec<half, 3u * K> cv, float tail
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) w[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) h[i] = arr[K + i];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) d[i] = arr[2u * K + i];
+    [ForceUnroll] for (uint i = 0u; i < K; i++) w[i] = clamp(arr[i], -kCRQSMaxRaw, kCRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K; i++) h[i] = clamp(arr[K + i], -kCRQSMaxRaw, kCRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K; i++) d[i] = clamp(arr[2u * K + i], -kCRQSMaxRaw, kCRQSMaxRaw);
     return crqsInverse<K>(y, w, h, d, tail);
 }

@@ -37,9 +37,19 @@ static const float kRQSMinDerivative = 1e-3f;
 // softplus_inv(1 - kRQSMinDerivative) ≈ 0.5413
 // Used as the fixed unnormalised boundary derivative so knot slopes start at 1.
 static const float kRQSBoundaryUnnorm = 0.5413f;
+static const float kRQSMaxRaw = 15.0f;
 
 [Differentiable]
 float rqsSoftplus(float x) { return x > 20.0f ? x : log(1.0f + exp(x)); }
+
+[Differentiable]
+float rqsDerivative(float raw)
+{
+    // Conditioner output layers are zero-initialised. Apply the same inverse-softplus
+    // offset used at the fixed boundaries so a zero output means slope 1 everywhere and
+    // the complete coupling starts as the identity.
+    return kRQSMinDerivative + rqsSoftplus(raw + kRQSBoundaryUnnorm);
+}
 
 // ─── Array-form forward transform ────────────────────────────────────────────
 
@@ -86,10 +96,10 @@ FlowStep rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 1
 
     // knot derivatives: softplus + floor, boundaries fixed to identity slope
     float deriv[K + 1u];
-    deriv[0] = kRQSMinDerivative + rqsSoftplus(kRQSBoundaryUnnorm);
+    deriv[0] = rqsDerivative(0.0f);
     [ForceUnroll] for (uint i = 0; i < K - 1u; i++)
-        deriv[i + 1] = kRQSMinDerivative + rqsSoftplus(d[i]);
-    deriv[K] = kRQSMinDerivative + rqsSoftplus(kRQSBoundaryUnnorm);
+        deriv[i + 1] = rqsDerivative(d[i]);
+    deriv[K] = rqsDerivative(0.0f);
 
     int bin = 0;
     [ForceUnroll] for (uint i = 0; i < K; i++) bin = (x >= cumW[i + 1]) ? int(i + 1) : bin;
@@ -107,12 +117,13 @@ FlowStep rqsForward<let K : uint>(float x, float w[K], float h[K], float d[K - 1
     float t1mt   = theta * (1.0f - theta);
     float num    = bh * (delta * theta * theta + dk * t1mt);
     float denom  = delta + (dk + dk1 - 2.0f * delta) * t1mt;
-    float y      = ch + num / denom;
+    float safeDenom = max(denom, 1e-20f);
+    float y      = ch + num / safeDenom;
 
     float dnumer = delta * delta * (
         dk1 * theta * theta + 2.0f * delta * t1mt + dk * (1.0f - theta) * (1.0f - theta)
     );
-    float logDet = log(dnumer) - 2.0f * log(abs(denom));
+    float logDet = log(max(dnumer, 1e-30f)) - 2.0f * log(safeDenom);
 
     FlowStep r = { y, logDet };
     return r;
@@ -158,10 +169,10 @@ FlowStep rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 1
     }
 
     float deriv[K + 1u];
-    deriv[0] = kRQSMinDerivative + rqsSoftplus(kRQSBoundaryUnnorm);
+    deriv[0] = rqsDerivative(0.0f);
     [ForceUnroll] for (uint i = 0; i < K - 1u; i++)
-        deriv[i + 1] = kRQSMinDerivative + rqsSoftplus(d[i]);
-    deriv[K] = kRQSMinDerivative + rqsSoftplus(kRQSBoundaryUnnorm);
+        deriv[i + 1] = rqsDerivative(d[i]);
+    deriv[K] = rqsDerivative(0.0f);
 
     int bin = 0;
     [ForceUnroll] for (uint i = 0; i < K; i++) bin = (y >= cumH[i + 1]) ? int(i + 1) : bin;
@@ -190,7 +201,8 @@ FlowStep rqsInverse<let K : uint>(float y, float w[K], float h[K], float d[K - 1
     float dnumer = delta * delta * (
         dk1 * theta * theta + 2.0f * delta * t1mt + dk * (1.0f - theta) * (1.0f - theta)
     );
-    float logDet = log(dnumer) - 2.0f * log(abs(denom));
+    float safeDenom = max(denom, 1e-20f);
+    float logDet = log(max(dnumer, 1e-30f)) - 2.0f * log(safeDenom);
 
     FlowStep r = { x, -logDet };
     return r;
@@ -203,9 +215,9 @@ FlowStep rqsForward<let K : uint>(float x, CoopVec<half, 3u * K - 1u> cv, no_dif
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K - 1u];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) w[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) h[i] = arr[K + i];
-    [ForceUnroll] for (uint i = 0u; i < K - 1u; i++) d[i] = arr[2u * K + i];
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) w[i] = clamp(arr[i], -kRQSMaxRaw, kRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) h[i] = clamp(arr[K + i], -kRQSMaxRaw, kRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K - 1u; i++) d[i] = clamp(arr[2u * K + i], -kRQSMaxRaw, kRQSMaxRaw);
     return rqsForward<K>(x, w, h, d, tail);
 }
 
@@ -213,8 +225,8 @@ FlowStep rqsInverse<let K : uint>(float y, CoopVec<half, 3u * K - 1u> cv, float 
 {
     let arr = CoopVecToArray(cv);
     float w[K], h[K], d[K - 1u];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) w[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) h[i] = arr[K + i];
-    [ForceUnroll] for (uint i = 0u; i < K - 1u; i++) d[i] = arr[2u * K + i];
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) w[i] = clamp(arr[i], -kRQSMaxRaw, kRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) h[i] = clamp(arr[K + i], -kRQSMaxRaw, kRQSMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K - 1u; i++) d[i] = clamp(arr[2u * K + i], -kRQSMaxRaw, kRQSMaxRaw);
     return rqsInverse<K>(y, w, h, d, tail);
 }
