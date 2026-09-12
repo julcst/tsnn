@@ -1,5 +1,4 @@
 import TSNN.Mixtures.GaussianHelpers;
-import TSNN.Utils.Slice;
 import TSNN.Utils.PCG32;
 
 [Differentiable]
@@ -21,18 +20,18 @@ float logTruncGaussianPDF(float2 x, float2 mean, float2 logSigma)
 }
 
 [Differentiable]
-float logSumExp<T : IFloat, Input : IArray<T>>(Input input)
+float logSumExp<T : IFloat, uint N>(T input[N])
 {
     float maxVal = -1.0#INF;
-    [MaxIters(64)]
-    for (uint i = 0; i < input.getCount(); ++i)
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
     {
         maxVal = max(maxVal, input[i].toFloat());
     }
 
     float sumExp = 0.0;
-    [MaxIters(64)]
-    for (uint i = 0; i < input.getCount(); ++i)
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
     {
         sumExp += exp(input[i].toFloat() - maxVal);
     }
@@ -56,13 +55,12 @@ struct TruncatedGMM<uint N>
     * @return log pdf
     */
     [Differentiable]
-    float eval<T : IFloat, Input : IArray<T>>(Input input, Output x)
+    float eval<T : IFloat>(T input[N * STRIDE], Output x)
     {
-        //static_assert(input.getCount() == N * STRIDE, "Input must have weight, mean and variance for each of the N components");
-
         if (any(x < Output(0.0)) || any(x > Output(1.0))) return -1.0#INF; // Sample is outside the unit square, return zero probability
 
         float logits[N];
+        float logWeights[N];
 
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
@@ -72,15 +70,14 @@ struct TruncatedGMM<uint N>
             let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat()); // uncontrained mean
             let logSigma = Output(input[offset + 3].toFloat(), input[offset + 4].toFloat()); // positive sigma
             logits[i] = logWeight + logTruncGaussianPDF(x, mean, logSigma);
+            logWeights[i] = logWeight;
         }
 
-        return logSumExp(logits) - logSumExp(Slice<T, Input>(input, 0, N, STRIDE)); // Normalize by the sum of weights
+        return logSumExp(logits) - logSumExp(logWeights); // Normalize by the sum of weights
     }
 
-    Output sample<T : IFloat, Input : IArray<T>>(Input input, inout PCG32 rand)
+    Output sample<T : IFloat>(T input[N * STRIDE], inout PCG32 rand)
     {
-        //static_assert(input.getCount() == N * STRIDE, "Input must have weight, mean and variance for each of the N components");
-
         float weights[N];
         float totalWeight = 0.0;
         [ForceUnroll]
