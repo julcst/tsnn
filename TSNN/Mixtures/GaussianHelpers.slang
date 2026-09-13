@@ -37,10 +37,9 @@
 [BackwardDerivative(erf_bwd)]
 float erf(float x)
 {
-    // Clamp input to [-4, 4] to avoid overflow in exp(-x^2) and loss of precision.
-    // Small performance impact (2-4%) but avoids NaN
-    float ax = min(abs(x), 4.0f);
-    float x2 = ax * ax;
+    // WARNING: Overflow for |x| > 4
+    float ax = abs(x);
+    float x2 = x * x;
     float r;
 
     if (ax <= 1.0f)
@@ -171,7 +170,7 @@ float expm1(float x)
 [Differentiable]
 float log1mexp(float x)
 {
-    return (x > -0.6931471805599453f) ? log(-expm1(x)) : log1p(-exp(x));
+    return (x > -log(2.0f)) ? log(-expm1(x)) : log1p(-exp(x));
 }
 
 // log(Phi(z)) for z <= 0 only: Phi(z) = 0.5*erfc(-z/sqrt2), so
@@ -183,8 +182,8 @@ float log1mexp(float x)
 [Differentiable]
 float logNormalCDFNonPositive(float z)
 {
-    let u = -z * 0.70710678118654752f; // -z/sqrt2, >= 0: erfcxPositive's domain
-    return -0.5f * z * z + log(erfcxPositive(u)) - 0.69314718055994531f;
+    let u = -z * (1.0f / sqrt(2.0f)); // -z/sqrt2, >= 0: erfcxPositive's domain
+    return -0.5f * z * z + log(erfcxPositive(u)) - log(2.0f);
 }
 
 // Stable log(Phi(z)) for the standard normal CDF, all real z. For z>0,
@@ -270,4 +269,92 @@ float normalCDFInverse(float p, float mean, float logSigma)
 {
     float k = exp(logSigma) * sqrt(2.0f);
     return mean + k * erfinv(2.0f * p - 1.0f);
+}
+
+// Stable log P(0 <= X <= 1) for X ~ N(mean, sigma^2), sigma = exp(logSigma).
+// This normalizer used to come from erf((1-mean)*k)+erf(mean*k) directly (see
+// logTruncGaussianPDF below), which underflows to exactly 0 -- log(0) = -inf,
+// then NaN gradients -- once the standardized interval [zLo, zHi] sits
+// entirely in one tail. This keeps the interior case's cheap erf evaluation
+// (both CDF values are O(1) there, no cancellation) but routes both tail
+// cases through logNormalCDF and a logsubexp identity so the subtraction of
+// two CDF values never happens in linear (collapsible) space: log(a - b) =
+// log(a) + log1mexp(log(b) - log(a)) for a >= b > 0, where log(a) and log(b)
+// individually stay finite (they cancel the common -z^2/2 term algebraically
+// instead of forming exp(-z^2/2) and rounding it to zero first).
+// Branchless-tail variant: keeps the interior erf fast path (it's a different,
+// cheaper formula, not something a swap/negate can fold in) but collapses the
+// two tail branches -- which were exact mirror images of each other -- into
+// one, reflecting unconditionally via swap+negate instead of duplicating the
+// log1mexp identity for each tail direction.
+//
+// [BackwardDerivative]: closed-form reverse-mode gradient instead of relying
+// on Slang's autodiff through logNormalCDF/log1mexp/erf. d(logM)/d(mean) and
+// d(logM)/d(logSigma) both reduce to phi(z)/M ratios (see logTruncMass_bwd);
+// computing those ratios as exp(logPhi(z) - logM) keeps M itself -- which can
+// collapse to 0 in exactly the tail regime this file exists to handle -- out
+// of the computation entirely, same spirit as the forward pass above.
+[BackwardDerivative(logTruncMass_bwd)]
+float logTruncMass(float mean, float logSigma)
+{
+    let invSigma = exp(-logSigma);
+    let zLo = -mean * invSigma;         // (0 - mean) / sigma
+    let zHi = (1.0f - mean) * invSigma; // (1 - mean) / sigma; zHi > zLo always
+
+    if (zLo < 0.0f && zHi > 0.0f)
+    {
+        // Interior: both CDF values are O(1) here, so the direct erf
+        // difference is well-behaved and cheaper than routing through
+        // logNormalCDF/log1mexp.
+        let invSqrt2 = 1.0f / sqrt(2.0f);
+        return log(0.5f * (erf(zHi * invSqrt2) - erf(zLo * invSqrt2)));
+    }
+
+    let reflect = zLo >= 0.0f;
+    let lo = reflect ? -zHi : zLo;
+    let hi = reflect ? -zLo : zHi;
+
+    let logHi = logNormalCDF(hi);
+    let logLo = logNormalCDF(lo);
+    return logHi + log1mexp(logLo - logHi);
+}
+
+// d(logM)/d(mean) = -(phi(zHi) - phi(zLo)) / (sigma*M)
+// d(logM)/d(logSigma) = (zLo*phi(zLo) - zHi*phi(zHi)) / M
+// where M = exp(logM) is the truncation mass and phi is the standard normal
+// density. Both are expressed as ratios phi(z)/M = exp(logPhi(z) - logM), so
+// the (possibly astronomically small) M is never formed in linear space.
+void logTruncMass_bwd(inout DifferentialPair<float> dpMean, inout DifferentialPair<float> dpLogSigma, float dOut)
+{
+    let mean = dpMean.p;
+    let logSigma = dpLogSigma.p;
+    let invSigma = exp(-logSigma);
+    let zLo = -mean * invSigma;
+    let zHi = (1.0f - mean) * invSigma;
+
+    let logM = logTruncMass(mean, logSigma);
+    let logNormConst = -0.5f * log(2.0f * float.getPi()); // log(1/sqrt(2*pi))
+    let ratioLo = exp(logNormConst - 0.5f * zLo * zLo - logM); // phi(zLo) / M
+    let ratioHi = exp(logNormConst - 0.5f * zHi * zHi - logM); // phi(zHi) / M
+
+    let dMean = (ratioLo - ratioHi) * invSigma;
+    let dLogSigma = zLo * ratioLo - zHi * ratioHi;
+
+    dpMean = diffPair(mean, dOut * dMean);
+    dpLogSigma = diffPair(logSigma, dOut * dLogSigma);
+}
+
+[Differentiable]
+float logTruncGaussianPDF(float2 x, float2 mean, float2 logSigma)
+{
+    let inverseSigma = exp(-logSigma);
+    let diff = (x - mean) * inverseSigma;
+    let exponent = 0.5 * dot(diff, diff);
+    float logPdf = -log(2.0f * float.getPi()) - logSigma.x - logSigma.y - exponent;
+
+    [ForceUnroll]
+    for (uint d = 0; d < 2; ++d)
+        logPdf -= logTruncMass(mean[d], logSigma[d]);
+
+    return logPdf;
 }
