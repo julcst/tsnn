@@ -153,16 +153,29 @@ void erfcxPositive_bwd(inout DifferentialPair<float> dpx, float dOut)
 // one: for arguments this small, exp(x)-1 or log(1+y) lose most of their
 // significant digits to cancellation, so a short Taylor series covers the
 // region a direct call would get wrong.
+//
+// The threshold below (and the Taylor series' one extra term) replaces an
+// earlier |arg| > 1e-4 cutoff that was far too tight for float32: direct
+// exp(x)-1 (or log(1+y)) loses roughly log2(6e-8/|arg|) bits to cancellation,
+// so 1e-4 -- covering only |arg| < 1e-4 with Taylor -- left the entire
+// 1e-4..~1e-2 band on the direct branch, which is most of this file's actual
+// arguments (measured up to ~4200 ULP error via TruncatedGMM.slang's calls;
+// see tests/gaussianHelpers/). 0.05 plus a fourth Taylor term brings that
+// down to ~25-55 ULP at the same instruction count -- a threshold/order fix,
+// not a different algorithm. (A full range-reduced expm1f/log1pf, e.g.
+// Norbert Juffa's forums.developer.nvidia.com/t/298202 and t/40575, gets to
+// ~1 ULP but costs 2-2.7x more per call; not worth it for this file's narrow
+// argument range.)
 [Differentiable]
 float log1p(float y)
 {
-    return (abs(y) > 1e-4f) ? log(1.0f + y) : (y - 0.5f * y * y + y * y * y / 3.0f);
+    return (abs(y) > 0.05f) ? log(1.0f + y) : (y * fma(y, fma(y, fma(y, -1.0f / 4.0f, 1.0f / 3.0f), -0.5f), 1.0f));
 }
 
 [Differentiable]
 float expm1(float x)
 {
-    return (abs(x) > 1e-4f) ? (exp(x) - 1.0f) : (x + 0.5f * x * x + x * x * x / 6.0f);
+    return (abs(x) > 0.05f) ? (exp(x) - 1.0f) : (x * fma(x, fma(x, fma(x, 1.0f / 24.0f, 1.0f / 6.0f), 0.5f), 1.0f));
 }
 
 // log(1 - exp(x)) for x <= 0, per Machler (2012); avoids ever forming the
@@ -208,60 +221,75 @@ float normalCDF(float x, float mean, float logSigma)
     return exp(logNormalCDF(x, mean, logSigma));
 }
 
-// Fast inverse error function approximation
-// Source: "A handy approximation for the error function and its inverse" by Sergei Winitzki.
-// Code: https://stackoverflow.com/questions/27229371/inverse-error-function-in-c
-// From: https://gpuopen.com/learn/sampling-normal-gaussian-distribution-gpus/
-[ForceInline]
-float erfinv_fast(float x)
-{
-    float tt1, tt2, lnx, sgn;
-    sgn = (x < 0.0f) ? -1.0f : 1.0f;
- 
-    x = (1.0f - x) * (1.0f + x);
-    lnx = log(x);
- 
-    tt1 = 2.0f / (float.getPi() * 0.147f) + 0.5f * lnx;
-    tt2 = 1.0f / (0.147f) * lnx;
- 
-    return (sgn * sqrt(-tt1 + sqrt(tt1 * tt1 - tt2)));
-}
-
-// Precise inverse error function approximation using polynomials
-// Source: "Approximating the erfinv function"
-// https://people.maths.ox.ac.uk/gilesm/files/gems_erfinv.pdf
+// Inverse error function approximation.
+// Slang/SPIR-V translation of Norbert Juffa's BSD-2-Clause compact erfinvf.
+// https://forums.developer.nvidia.com/t/a-very-compact-implementation-of-the-inverse-error-function-erfinvf/61961
+// Replaces an earlier port of Mike Giles's "Approximating the erfinv function"
+// polynomial (https://people.maths.ox.ac.uk/gilesm/files/gems_erfinv.pdf):
+// measured max error over this file's argument range (see
+// tests/gaussianHelpers/) was 5 ULP for Giles's version vs. 4 ULP for this
+// one, at a small GPU-time win (~9%) rather than a cost -- reported max error
+// for the original CUDA implementation: 2.446816 ULP. `lg2.approx.ftz.f32` ->
+// log2().
+//
+// Copyright (c) 2018, Norbert Juffa
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 [ForceInline]
 float erfinv(float x)
 {
-    float w, p;
-    w = -log((1.0f - x) * (1.0f + x));
-    if (w < 5.000000f)
+    float t = log2(fma(x, -x, 1.0f));
+    float p, r;
+    if (t < -8.8359375f)
     {
-        w = w - 2.500000f;
-        p = 2.81022636e-08f;
-        p = 3.43273939e-07f + p * w;
-        p = -3.5233877e-06f + p * w;
-        p = -4.39150654e-06f + p * w;
-        p = 0.00021858087f + p * w;
-        p = -0.00125372503f + p * w;
-        p = -0.00417768164f + p * w;
-        p = 0.246640727f + p * w;
-        p = 1.50140941f + p * w;
+        p =              1.50166858e-11f;
+        p = fma(p, t,  2.10561724e-09f);
+        p = fma(p, t,  1.27291500e-07f);
+        p = fma(p, t,  4.29223974e-06f);
+        p = fma(p, t,  8.60039654e-05f);
+        p = fma(p, t,  9.49774636e-04f);
+        p = fma(p, t,  1.88959786e-03f);
+        p = fma(p, t, -1.85239315e-01f);
+        p = fma(p, t,  8.36782515e-01f);
+        r = fma(p, x, 0.0f);
     }
     else
     {
-        w = sqrt(w) - 3.000000f;
-        p = -0.000200214257f;
-        p = 0.000100950558f + p * w;
-        p = 0.00134934322f + p * w;
-        p = -0.00367342844f + p * w;
-        p = 0.00573950773f + p * w;
-        p = -0.0076224613f + p * w;
-        p = 0.00943887047f + p * w;
-        p = 1.00167406f + p * w;
-        p = 2.83297682f + p * w;
+        p =              2.00998329e-10f;
+        p = fma(p, t,  7.63788321e-09f);
+        p = fma(p, t,  9.44120231e-08f);
+        p = fma(p, t,  1.27279494e-08f);
+        p = fma(p, t, -8.98369126e-06f);
+        p = fma(p, t, -3.40910883e-05f);
+        p = fma(p, t,  7.70850747e-04f);
+        p = fma(p, t,  5.54407062e-03f);
+        p = fma(p, t, -1.60820886e-01f);
+        p = fma(p, t,  8.86226892e-01f);
+        r = x * p;
     }
-    return p * x;
+    return r;
 }
 
 [ForceInline]
