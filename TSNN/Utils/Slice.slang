@@ -1,19 +1,53 @@
-struct Slice<T, A : IArray<T>> : IArray<T>
+public interface IVector<T> : IDifferentiable
+    where T : IFloat
 {
-    A base;
+    /// The compile-time size of the vector.
+    public static const int Size;
+
+    /// Ensures the differential is also a vector with the same structure.
+    // __constraint Differential : IVector<T>;
+
+    public __subscript(int index) -> T
+    {
+        [Differentiable] get;
+        [Differentiable] set;
+    }
+}
+
+public extension<T, int N> Array<T, N> : IVector<T>
+    where T : IFloat
+{
+    public static const int Size = N;
+
+    __subscript(int index) -> T
+    {
+        [Differentiable]
+        get { return this[index]; }
+        [Differentiable]
+        set { this[index] = newValue; }
+    }
+}
+
+public struct Slice<int N, T, V : IVector<T>> : IVector<T>
+    where T : IFloat
+{
+    public static const int Size = N;
+    V base;
     int offset;
-    int count;
     int stride;
 
-    __init(A base, int offset, int count, int stride = 1)
+    __init(V base, int offset, int stride = 1)
     {
         this.base = base;
         this.offset = offset;
-        this.count = count;
         this.stride = stride;
     }
-    
-    int getCount() { return count; }
 
-    __subscript(int index) -> T { get { return base[offset + index * stride]; } }
+    __subscript(int index) -> T
+    {
+        [Differentiable]
+        get { return base[offset + index * stride]; }
+        [Differentiable]
+        set { base[offset + index * stride] = newValue; }
+    }
 }

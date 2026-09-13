@@ -39,6 +39,60 @@ float logSumExp<T : IFloat, uint N>(T input[N])
     return maxVal + log(sumExp);
 }
 
+float[N] stableSoftmax<T : IFloat, uint N>(T input[N])
+{
+    float maxVal = -1.0#INF;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+    {
+        maxVal = max(maxVal, input[i].toFloat());
+    }
+
+    float output[N];
+    float sumExp = 0.0;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+    {
+        output[i] = exp(input[i].toFloat() - maxVal);
+        sumExp += output[i];
+    }
+
+    float invSumExp = 1.0 / sumExp;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+    {
+        output[i] *= invSumExp;
+    }
+    return output;
+}
+
+uint sampleSoftmax<T : IFloat, uint N>(T input[N], float u)
+{
+    float maxVal = -1.0#INF;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+    {
+        maxVal = max(maxVal, input[i].toFloat());
+    }
+
+    float output[N];
+    float sumExp = 0.0;
+    [ForceUnroll]
+    for (uint i = 0; i < N; ++i)
+    {
+        output[i] = exp(input[i].toFloat() - maxVal);
+        sumExp += output[i];
+    }
+
+    var r = u * sumExp;
+    for (uint i = 0; i < N; ++i)
+    {
+        r -= output[i];
+        if (r < 0.0) return i;
+    }
+    return N - 1;
+}
+
 /**
 * Truncated Gaussian Mixture Model (GMM) implementation.
 * This model represents a mixture of N Gaussian components, each parametrized by its log weight, mean, and log sigma, truncated to [0, 1]^2.
@@ -78,31 +132,16 @@ struct TruncatedGMM<uint N>
 
     Output sample<T : IFloat>(T input[N * STRIDE], inout PCG32 rand)
     {
-        float weights[N];
-        float totalWeight = 0.0;
+        float[N] logWeights;
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
         {
-            let w = exp(input[i * STRIDE + 0].toFloat()); // weight
-            weights[i] = w;
-            totalWeight += w;
+            logWeights[i] = input[i * STRIDE].toFloat();
         }
-
-        var r = rand.nextFloat() * totalWeight;
-        uint componentIndex = 0;
-        [ForceUnroll]
-        for (uint i = 0; i < N; ++i)
-        {
-            r -= weights[i];
-            if (r <= 0.0)
-            {
-                componentIndex = i;
-                break;
-            }
-        }
+        let bin = sampleSoftmax(logWeights, rand.nextFloat());
 
         // Sample from the selected Gaussian component
-        let offset = componentIndex * STRIDE;
+        let offset = bin * STRIDE;
         let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat());
         let logSigma = Output(input[offset + 3].toFloat(), input[offset + 4].toFloat());
 

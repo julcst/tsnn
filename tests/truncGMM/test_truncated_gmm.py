@@ -25,9 +25,9 @@ COMPONENTS = 16
 PARAM_COUNT = COMPONENTS * 5
 # The default is deliberately longer than the former exploratory probe. A
 # reduced value is useful while iterating on the GPU kernel locally.
-TRAIN_STEPS = int(os.environ.get("TSNN_GMM_TEST_STEPS", "500"))
+TRAIN_STEPS = int(os.environ.get("TSNN_GMM_TEST_STEPS", "10000"))
 BATCH_SIZE = 256
-REPORT_EVERY = 10
+REPORT_EVERY = 500
 
 
 def buffer(device, values, rw=False):
@@ -42,9 +42,17 @@ class Probe:
     def __init__(self):
         self.device = spy.create_device(include_paths=[ROOT])
         self.kernels = {}
-        for name in ("cdfMain", "nllGradMain", "evalMain", "halfEvalMain", "sampleMain", "adamMain"):
+        for name in (
+            "cdfMain",
+            "nllGradMain",
+            "evalMain",
+            "halfEvalMain",
+            "sampleMain",
+            "adamMain",
+        ):
             program = self.device.load_program(
-                module_name="tests/truncGMM/TruncatedGMMTest.slang", entry_point_names=[name]
+                module_name="tests/truncGMM/TruncatedGMMTest.slang",
+                entry_point_names=[name],
             )
             self.kernels[name] = self.device.create_compute_kernel(program)
 
@@ -70,7 +78,9 @@ class Probe:
     def nll_grad(self, samples, state, read_loss=False, read_grad=False):
         inp = buffer(self.device, samples.reshape(-1))
         losses = buffer(self.device, np.zeros(len(samples), np.float32), rw=True)
-        grads = buffer(self.device, np.zeros((len(samples), PARAM_COUNT), np.float32), rw=True)
+        grads = buffer(
+            self.device, np.zeros((len(samples), PARAM_COUNT), np.float32), rw=True
+        )
         self.kernels["nllGradMain"].dispatch(
             thread_count=[len(samples), 1, 1],
             vars={
@@ -82,7 +92,11 @@ class Probe:
             },
         )
         loss = float(losses.to_numpy().view(np.float32).mean()) if read_loss else None
-        grad = grads.to_numpy().view(np.float32).reshape(-1, PARAM_COUNT).mean(axis=0) if read_grad else None
+        grad = (
+            grads.to_numpy().view(np.float32).reshape(-1, PARAM_COUNT).mean(axis=0)
+            if read_grad
+            else None
+        )
         return loss, grads, grad
 
     def adam_step(self, state, grads, batch_size, step, learning_rate):
@@ -151,7 +165,9 @@ def einstein_samples(density, count, rng):
     idx = rng.choice(len(weights), size=count, p=weights)
     y, x = np.divmod(idx, density.shape[1])
     jitter = rng.random((count, 2), dtype=np.float32)
-    return np.column_stack(((x + jitter[:, 0]) / density.shape[1], (y + jitter[:, 1]) / density.shape[0])).astype(np.float32)
+    return np.column_stack(
+        ((x + jitter[:, 0]) / density.shape[1], (y + jitter[:, 1]) / density.shape[0])
+    ).astype(np.float32)
 
 
 def initial_params():
@@ -168,11 +184,19 @@ def save_comparison(reference, pdf, samples):
     OUT_DIR.mkdir(exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(12, 6), layout="constrained")
     vmax = max(float(reference.max()), float(pdf.max()))
-    image_args = {"origin": "upper", "extent": (0, 1, 1, 0), "cmap": "magma", "vmin": 0.0, "vmax": vmax}
+    image_args = {
+        "origin": "upper",
+        "extent": (0, 1, 1, 0),
+        "cmap": "magma",
+        "vmin": 0.0,
+        "vmax": vmax,
+    }
     reference_image = axes[0].imshow(reference, **image_args)
     axes[0].set(title="Reference density", xlabel="x", ylabel="y")
     model = axes[1].imshow(pdf, **image_args)
-    axes[1].scatter(samples[:3000, 0], samples[:3000, 1], s=1, c="black", alpha=0.35, linewidths=0)
+    axes[1].scatter(
+        samples[:3000, 0], samples[:3000, 1], s=1, c="black", alpha=0.35, linewidths=0
+    )
     axes[1].set(title=f"{COMPONENTS}-component GMM fit", xlabel="x", ylabel="y")
     fig.colorbar(reference_image, ax=axes, label="PDF")
     fig.savefig(OUT_DIR / "einstein_fit_comparison.png", dpi=160)
@@ -186,11 +210,15 @@ def test_truncated_gmm_fit_with_gpu_adam(probe):
     state = probe.create_adam_state(initial_params())
 
     initial = None
-    progress = trange(1, TRAIN_STEPS + 1, desc="GMM Adam", unit="step", dynamic_ncols=True)
+    progress = trange(
+        1, TRAIN_STEPS + 1, desc="GMM Adam", unit="step", dynamic_ncols=True
+    )
     for step in progress:
         batch = data[rng.integers(0, len(data), BATCH_SIZE)]
         report = step == 1 or step % REPORT_EVERY == 0
-        loss, grads, grad = probe.nll_grad(batch, state, read_loss=report, read_grad=step == 1)
+        loss, grads, grad = probe.nll_grad(
+            batch, state, read_loss=report, read_grad=step == 1
+        )
         if initial is None:
             initial = loss
             assert grad is not None and np.max(np.abs(grad)) > 1e-4
@@ -200,7 +228,9 @@ def test_truncated_gmm_fit_with_gpu_adam(probe):
 
     params = probe.parameters(state)
     final, _, _ = probe.nll_grad(data[:1024], state, read_loss=True)
-    assert np.isfinite(final) and final < initial - 0.05, f"NLL did not converge: {initial:.4f} -> {final:.4f}"
+    assert np.isfinite(final) and final < initial - 0.05, (
+        f"NLL did not converge: {initial:.4f} -> {final:.4f}"
+    )
 
     res = 256
     xy = (np.arange(res, dtype=np.float32) + 0.5) / res
@@ -215,7 +245,9 @@ def test_truncated_gmm_fit_with_gpu_adam(probe):
     samples = probe.sample(65_536, params)
     assert np.all((samples >= 0) & (samples <= 1))
     bins = 32
-    hist, _, _ = np.histogram2d(samples[:, 0], samples[:, 1], bins=bins, range=((0, 1), (0, 1)))
+    hist, _, _ = np.histogram2d(
+        samples[:, 0], samples[:, 1], bins=bins, range=((0, 1), (0, 1))
+    )
     expected = pdf.reshape(bins, res // bins, bins, res // bins).mean(axis=(1, 3))
     expected /= expected.sum()
     assert np.abs(hist / hist.sum() - expected.T).sum() < 0.12
