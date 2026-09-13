@@ -11,6 +11,7 @@ float logTruncGaussianPDF(float2 x, float2 mean, float2 logSigma)
     for (uint d = 0; d < 2; ++d)
     {
         let k = inverseSigma[d] / sqrt(2.0);
+        // WARNING: This collapses to zero for extreme values of mean and logSigma
         area *= erf((1.0 - mean[d]) * k) + erf(mean[d] * k);
     }
 
@@ -26,7 +27,7 @@ float logSumExp<T : IFloat, uint N>(T input[N])
     [ForceUnroll]
     for (uint i = 0; i < N; ++i)
     {
-        maxVal = max(maxVal, input[i].toFloat());
+        maxVal = no_diff max(maxVal, input[i].toFloat());
     }
 
     float sumExp = 0.0;

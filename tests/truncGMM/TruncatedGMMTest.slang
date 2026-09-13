@@ -13,8 +13,8 @@ static const uint PARAM_COUNT = COMPONENTS * 5;
 StructuredBuffer<float> gInputs;
 RWStructuredBuffer<float> gOutputs;
 
-// This differentiable-pointer wrapper writes one gradient row per training
-// sample. evalNLL copies it into the GMM's fixed-size float array.
+// This differentiable-pointer wrapper writes parameter-major gradients for training
+// samples. evalNLL copies it into the GMM's fixed-size float array.
 struct ParamBufferGrad : IDifferentiablePtrType
 {
     typealias Differential = ParamBufferGrad;
@@ -41,7 +41,7 @@ float loadParam(ParamBuffer params, int index)
 
 void loadParam_bwd(DifferentialPtrPair<ParamBuffer> params, int index, float dOut)
 {
-    params.d.values[params.d.row * PARAM_COUNT + uint(index)] += dOut;
+    params.d.values[uint(index) * gCount + params.d.row] += dOut;
 }
 
 [numthreads(64, 1, 1)]
@@ -56,15 +56,43 @@ void cdfMain(uint3 tid : SV_DispatchThreadID)
     gOutputs[2 * i + 1] = normalCDFInverse(x, mean, logSigma);
 }
 
+[Differentiable]
+float componentPDF(float2 x, float2 mean, float2 logSigma)
+{
+    return exp(logTruncGaussianPDF(x, mean, logSigma));
+}
+
+// Exercise all six inputs and the exp(logPDF) chain rule, including dPDF/dx.
+[numthreads(64, 1, 1)]
+void componentGradMain(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= gCount) return;
+    var x = diffPair(float2(gInputs[6*i], gInputs[6*i+1]), float2(0.0));
+    var mean = diffPair(float2(gInputs[6*i+2], gInputs[6*i+3]), float2(0.0));
+    var logSigma = diffPair(float2(gInputs[6*i+4], gInputs[6*i+5]), float2(0.0));
+    gOutputs[7*i] = componentPDF(x.p, mean.p, logSigma.p);
+    bwd_diff(componentPDF)(x, mean, logSigma, 1.0);
+    for (uint d = 0; d < 2; ++d)
+    {
+        gOutputs[7*i+1+d] = x.d[d];
+        gOutputs[7*i+3+d] = mean.d[d];
+        gOutputs[7*i+5+d] = logSigma.d[d];
+    }
+}
+
 // A sixteen-component model exercises mixture-weight normalization as well as
 // the full truncated-GMM evaluator. One parameter vector is
-// differentiated for every target sample; Python sums the per-sample gradients.
+// differentiated for every target sample; Adam averages the per-sample gradients.
 [numthreads(64, 1, 1)]
 void nllGradMain(uint3 tid : SV_DispatchThreadID)
 {
     uint i = tid.x;
     if (i >= gCount) return;
     float2 x = float2(gInputs[2 * i], gInputs[2 * i + 1]);
+    [ForceUnroll]
+    for (uint j = 0; j < PARAM_COUNT; ++j)
+        gParamGrads[j * gCount + i] = 0.0;
     ParamBuffer params = ParamBuffer(gParams, i);
     ParamBufferGrad dparams = ParamBufferGrad(gParamGrads, i);
     float nll = evalNLL(params, x);
@@ -74,6 +102,35 @@ void nllGradMain(uint3 tid : SV_DispatchThreadID)
     bwd_diff(evalNLL)(dparamsPair, dxPair, 1.0);
 
     gOutputs[i] = nll;
+}
+
+// Accumulate in thread-local registers, then write each gradient once using
+// a parameter-major layout so neighboring lanes write neighboring addresses.
+[numthreads(64, 1, 1)]
+void nllArrayGradMain(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= gCount) return;
+    float values[PARAM_COUNT] = {};
+    float zeros[PARAM_COUNT] = {};
+    [ForceUnroll]
+    for (uint j = 0; j < PARAM_COUNT; ++j)
+        values[j] = gParams[j];
+    float2 x = float2(gInputs[2 * i], gInputs[2 * i + 1]);
+    var params = diffPair(values, zeros);
+    var point = diffPair(x, float2(0.0));
+    gOutputs[i] = evalArrayNLL(values, x);
+    bwd_diff(evalArrayNLL)(params, point, 1.0);
+    [ForceUnroll]
+    for (uint j = 0; j < PARAM_COUNT; ++j)
+        gParamGrads[j * gCount + i] = params.d[j];
+}
+
+[Differentiable]
+float evalArrayNLL(float values[PARAM_COUNT], float2 x)
+{
+    TruncatedGMM<COMPONENTS> gmm;
+    return -gmm.eval(values, x);
 }
 
 [Differentiable]
@@ -160,7 +217,7 @@ void adamMain(uint3 tid : SV_DispatchThreadID)
 
     float gradient = 0.0;
     for (uint sampleIndex = 0; sampleIndex < gBatchSize; ++sampleIndex)
-        gradient += gParamGrads[sampleIndex * PARAM_COUNT + parameterIndex];
+        gradient += gParamGrads[parameterIndex * gBatchSize + sampleIndex];
     gradient /= float(gBatchSize);
 
     vector<float, 1> parameter = vector<float, 1>(gTrainParams[parameterIndex]);
