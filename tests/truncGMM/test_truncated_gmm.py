@@ -331,8 +331,14 @@ def test_component_pdf_derivative(probe):
 
 
 def test_tail_diagnostics(probe):
-    # Diagnostic only: cancellation in float erf differences remains outside
-    # the fast path's supported accuracy. Do not hide it with gradient guards.
+    # Was diagnostic-only: the old erf-sum truncation mass in
+    # logTruncGaussianPDF underflowed to exactly 0 once a component's
+    # standardized interval sat entirely in one tail (mean/log_sigma pairs
+    # below are exactly that regime), producing NaN gradients no gradient
+    # guard could recover. logTruncMass (TSNN/Mixtures/TruncatedGMM.slang)
+    # now routes both tails through a stable erfcx-based log-CDF instead of
+    # clamping mean/log_sigma away from the collapse, so this is a real
+    # regression assertion: every configuration below must stay finite.
     points = np.array([[0, 0], [0.5, 0.5], [1, 1]], np.float32)
     for mean, log_sigma in ((0.5, -3), (-0.5, -1), (-0.5, -3), (1.5, -3)):
         params = initial_params().reshape(COMPONENTS, 5)
@@ -342,9 +348,14 @@ def test_tail_diagnostics(probe):
             points, probe.create_adam_state(params.reshape(-1)), True
         )
         values = grads.to_numpy().view(np.float32)
+        nonfinite = np.count_nonzero(~np.isfinite(values))
         print(
             f"tail mean={mean} log_sigma={log_sigma}: loss={loss}, "
-            f"nonfinite_gradients={np.count_nonzero(~np.isfinite(values))}/{values.size}"
+            f"nonfinite_gradients={nonfinite}/{values.size}"
+        )
+        assert np.isfinite(loss), f"non-finite loss at mean={mean} log_sigma={log_sigma}"
+        assert nonfinite == 0, (
+            f"{nonfinite} non-finite gradients at mean={mean} log_sigma={log_sigma}"
         )
 
 

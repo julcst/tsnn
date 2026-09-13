@@ -80,11 +80,133 @@ void erf_bwd(inout DifferentialPair<float> dpx, float dOut)
     dpx = diffPair(x, dx);
 }
 
+// ─── erfcx-based stable log-space normal CDF ──────────────────────────────────
+//
+// logTruncGaussianPDF's truncation-mass term used to go through erf() alone,
+// which collapses to exactly 0 (so log(0) = -inf, then NaN gradients) once the
+// standardized truncation interval sits entirely in one tail -- exactly the
+// regime an unconstrained MLP head eventually wanders into. Fixing that at the
+// source (a numerically stable logNormalCDF) is more robust than clamping
+// mean/logSigma to keep erf() away from its blind spot, which trades the
+// collapse for a wide dead (zero-gradient) region instead.
+//
+// erfcxPositive is Norbert Juffa's BSD-2-Clause "accuracy-optimized,
+// performance-neutral" erfcxf, nonnegative-input branch only -- see
+// https://forums.developer.nvidia.com/t/accuracy-optimized-performance-neutral-implementation-of-erfcxf/226946
+// The two `rcp.approx.ftz.f32` PTX reciprocals in the original CUDA source
+// have no equivalent outside CUDA, so this uses plain division instead; the
+// Newton-style residual correction that follows each one in the original
+// still applies (and costs the same few FMAs) whether the reciprocal it's
+// correcting was exact or approximate, so accuracy can only improve.
+// Coefficients and structure are otherwise unchanged. Negative-input handling
+// is dropped per Juffa's note that it roughly doubles the cost -- every call
+// site here reflects into the nonnegative half first.
+// Maximum error reported for the original CUDA nonnegative-input path: 1.97521 ULP.
+[ForceInline]
+[BackwardDerivative(erfcxPositive_bwd)]
+float erfcxPositive(float a)
+{
+    // q = (a-2)/(a+2), mapping [0, INF) -> [-1, 1]
+    float p = a + 2.0f;
+    float r = 1.0f / p;
+    float q = fma(-4.0f, r, 1.0f);
+    float t = fma(q + 1.0f, -2.0f, a);
+    float e = fma(-a, q, t);
+    q = fma(r, e, q);
+
+    // Approximate (1+2a)*exp(a*a)*erfc(a) as p(q)+1 for q in [-1,1]
+    p =            5.92619181e-5f;
+    p = fma(p, q,  1.61231728e-4f);
+    p = fma(p, q, -3.46499495e-4f);
+    p = fma(p, q, -1.39683776e-3f);
+    p = fma(p, q,  1.20587996e-3f);
+    p = fma(p, q,  8.69013276e-3f);
+    p = fma(p, q, -8.01389851e-3f);
+    p = fma(p, q, -5.42122647e-2f);
+    p = fma(p, q,  1.64048553e-1f);
+    p = fma(p, q, -1.66031078e-1f);
+    p = fma(p, q, -9.27637145e-2f);
+    p = fma(p, q,  2.76978403e-1f);
+
+    // Divide (1+p) by (1+2a) => exp(a*a)*erfc(a) == erfcx(a)
+    float d = fma(0.25f, a, 0.125f);
+    r = 1.0f / d;
+    q = fma(p, r, r);
+    e = fma(fma(-a, q, 4.0f), 0.25f, fma(-0.125f, q, p)); // residual correction
+    r = 0.125f * fma(e, r, q);
+
+    return isinf(a) ? 0.0f : r;
+}
+
+// d/dx erfcx(x) = 2x*erfcx(x) - 2/sqrt(pi) -- exact for all real x, cheap, and
+// reuses the forward value instead of differentiating the degree-11
+// polynomial above (the whole point of routing through this identity).
+void erfcxPositive_bwd(inout DifferentialPair<float> dpx, float dOut)
+{
+    float x = dpx.p;
+    float value = erfcxPositive(x);
+    float dx = dOut * (2.0f * x * value - 2.0f / sqrt(float.getPi()));
+    dpx = diffPair(x, dx);
+}
+
+// Stable log1p/expm1/log(1-exp(x)) for x<=0 -- Slang/HLSL has neither log1p
+// nor expm1 built in. These favor the well-conditioned branch over the cheap
+// one: for arguments this small, exp(x)-1 or log(1+y) lose most of their
+// significant digits to cancellation, so a short Taylor series covers the
+// region a direct call would get wrong.
+[Differentiable]
+float log1p(float y)
+{
+    return (abs(y) > 1e-4f) ? log(1.0f + y) : (y - 0.5f * y * y + y * y * y / 3.0f);
+}
+
+[Differentiable]
+float expm1(float x)
+{
+    return (abs(x) > 1e-4f) ? (exp(x) - 1.0f) : (x + 0.5f * x * x + x * x * x / 6.0f);
+}
+
+// log(1 - exp(x)) for x <= 0, per Machler (2012); avoids ever forming the
+// (possibly tiny) 1-exp(x) directly.
+[Differentiable]
+float log1mexp(float x)
+{
+    return (x > -0.6931471805599453f) ? log(-expm1(x)) : log1p(-exp(x));
+}
+
+// log(Phi(z)) for z <= 0 only: Phi(z) = 0.5*erfc(-z/sqrt2), so
+// log(Phi(z)) = -z^2/2 + log(erfcx(-z/sqrt2)) - log(2) -- never forms the
+// (possibly tiny) linear-space Phi(z) directly. Split out of logNormalCDF
+// below (rather than a self-call under the z<=0 branch) because Slang's
+// compute-shader targets reject recursion outright, even the provably-single-
+// level kind a sign-flip reflection produces here.
+[Differentiable]
+float logNormalCDFNonPositive(float z)
+{
+    let u = -z * 0.70710678118654752f; // -z/sqrt2, >= 0: erfcxPositive's domain
+    return -0.5f * z * z + log(erfcxPositive(u)) - 0.69314718055994531f;
+}
+
+// Stable log(Phi(z)) for the standard normal CDF, all real z. For z>0,
+// reflect: Phi(z) = 1 - Phi(-z), and -z<=0 is the stable branch above.
+[Differentiable]
+float logNormalCDF(float z)
+{
+    if (z <= 0.0f)
+        return logNormalCDFNonPositive(z);
+    return log1mexp(logNormalCDFNonPositive(-z));
+}
+
+[Differentiable]
+float logNormalCDF(float x, float mean, float logSigma)
+{
+    return logNormalCDF((x - mean) * exp(-logSigma));
+}
+
 [ForceInline]
 float normalCDF(float x, float mean, float logSigma)
 {
-    float k = exp(-logSigma) / sqrt(2.0f);
-    return 0.5f * (1.0f + erf((x - mean) * k));
+    return exp(logNormalCDF(x, mean, logSigma));
 }
 
 // Fast inverse error function approximation

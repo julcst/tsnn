@@ -78,7 +78,7 @@ Reproduce from `examples/image_learn` with `uv run --script benchmark.py`,
 `uv run --script compare.py --markdown [--tcnn-jit bench_tcnn_jit.json]`.
 
 ## Examples
-For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn) and the [neural density estimation](examples/nde) example.
+For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn), [neural density estimation](examples/nde), and [hierarchical Gaussian mixture](examples/hggrid) examples.
 
 ## Falcor Usage
 To use this library in Falcor just add it as a [submodule](https://git-scm.com/book/en/v2/Git-Tools-Submodules) and list it in `external/CMakeLists.txt`:

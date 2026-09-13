@@ -1,23 +1,59 @@
 import TSNN.Mixtures.GaussianHelpers;
 import TSNN.Utils.PCG32;
 
+// Stable log P(0 <= X <= 1) for X ~ N(mean, sigma^2), sigma = exp(logSigma).
+// This normalizer used to come from erf((1-mean)*k)+erf(mean*k) directly (see
+// logTruncGaussianPDF below), which underflows to exactly 0 -- log(0) = -inf,
+// then NaN gradients -- once the standardized interval [zLo, zHi] sits
+// entirely in one tail. This keeps the interior case's cheap erf evaluation
+// (both CDF values are O(1) there, no cancellation) but routes both tail
+// cases through logNormalCDF and a logsubexp identity so the subtraction of
+// two CDF values never happens in linear (collapsible) space: log(a - b) =
+// log(a) + log1mexp(log(b) - log(a)) for a >= b > 0, where log(a) and log(b)
+// individually stay finite (they cancel the common -z^2/2 term algebraically
+// instead of forming exp(-z^2/2) and rounding it to zero first).
+[Differentiable]
+float logTruncMass(float mean, float logSigma)
+{
+    let invSigma = exp(-logSigma);
+    let zLo = -mean * invSigma;         // (0 - mean) / sigma
+    let zHi = (1.0f - mean) * invSigma; // (1 - mean) / sigma; zHi > zLo always
+
+    if (zHi <= 0.0f)
+    {
+        // Both quantiles in the left tail (mean well above the [0,1] interval).
+        let logHi = logNormalCDF(zHi);
+        let logLo = logNormalCDF(zLo);
+        return logHi + log1mexp(logLo - logHi);
+    }
+    if (zLo >= 0.0f)
+    {
+        // Both quantiles in the right tail (mean well below the [0,1] interval):
+        // reflect to the survival function SF(z) = Phi(-z), decreasing in z, so
+        // mass = SF(zLo) - SF(zHi) with SF(zLo) >= SF(zHi) >= 0.
+        let logLo = logNormalCDF(-zLo);
+        let logHi = logNormalCDF(-zHi);
+        return logLo + log1mexp(logHi - logLo);
+    }
+    // Interior: mean falls inside (or near) the interval, zLo < 0 < zHi -- both
+    // CDF values are O(1) here, so the direct erf difference is well-behaved.
+    let invSqrt2 = 0.70710678118654752f;
+    return log(0.5f * (erf(zHi * invSqrt2) - erf(zLo * invSqrt2)));
+}
+
 [Differentiable]
 float logTruncGaussianPDF(float2 x, float2 mean, float2 logSigma)
 {
     let inverseSigma = exp(-logSigma);
-
-    var area = 1.0;
-    [ForceUnroll]
-    for (uint d = 0; d < 2; ++d)
-    {
-        let k = inverseSigma[d] / sqrt(2.0);
-        // WARNING: This collapses to zero for extreme values of mean and logSigma
-        area *= erf((1.0 - mean[d]) * k) + erf(mean[d] * k);
-    }
-
     let diff = (x - mean) * inverseSigma;
     let exponent = 0.5 * dot(diff, diff);
-    return log(2.0 / float.getPi()) - exponent - logSigma.x - logSigma.y - log(area);
+
+    float logMass = 0.0;
+    [ForceUnroll]
+    for (uint d = 0; d < 2; ++d)
+        logMass += logTruncMass(mean[d], logSigma[d]);
+
+    return -log(2.0f * float.getPi()) - exponent - logSigma.x - logSigma.y - logMass;
 }
 
 [Differentiable]
@@ -27,7 +63,7 @@ float logSumExp<T : IFloat, uint N>(T input[N])
     [ForceUnroll]
     for (uint i = 0; i < N; ++i)
     {
-        maxVal = no_diff max(maxVal, input[i].toFloat());
+        maxVal = max(maxVal, input[i].toFloat());
     }
 
     float sumExp = 0.0;
