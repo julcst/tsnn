@@ -16,6 +16,33 @@
 //
 // Packed parameter order is [W(K) | V(K+1)].  Decode is inlined in each entry
 // point for the same autodiff-miscompile reason documented in RQS.slang.
+//
+// Two floors, both for the same reason PiecewiseLinear.slang floors its bin
+// probabilities: an unfloored softmax/normalisation can collapse a width or a
+// vertex height arbitrarily close to 0, which makes `rhs / max(vb, 1e-30f)`
+// (the linear-branch inverse) and the quadratic root's discriminant
+// ill-conditioned right at the values a trained conditioner tends to wander
+// into -- the recorded cause of the quadratic spline's training divergence.
+//
+//   kPQMinBinWidth: same convex-combination floor as RQS.slang's bin widths,
+//   applied to om[i] -- Sigma om == 1 is preserved exactly (linear in om, and
+//   the uniform field om==1/K satisfies it).
+//
+//   kPQMinVertex: v[i] = kPQMinVertex + (1-kPQMinVertex)*v[i], a convex
+//   combination of the normalised vertex heights with the all-ones field. The
+//   PDF-normalisation constraint Sigma om_i*(v_i+v_{i+1})/2 == 1 is LINEAR in
+//   v, and v==1 satisfies it (Sigma om_i*1 == 1 since Sigma om == 1); a convex
+//   combination of two solutions to a linear constraint is itself a solution,
+//   so this floor preserves the constraint exactly with no second
+//   re-normalisation pass needed.
+static const float kPQMinBinWidth = 1e-3f;
+static const float kPQMinVertex   = 1e-3f;
+
+// Every running-max below is seeded from -inf and loops over every index
+// (including 0), not from x[0] with the loop starting at i=1: the latter
+// measurably drops the backward-mode gradient path into index 0 under this
+// Slang version's autodiff -- see PiecewiseLinear.slang's header for the
+// isolated repro and FINDING.md.
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -29,23 +56,27 @@ FlowStep pqForward<let K : uint>(float x, float W[K], float V[K + 1u], no_diff f
 
     // widths ω via softmax(W); Σ ω = 1
     float om[K];
-    float maxW = W[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, W[i]);
+    float maxW = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K; i++) maxW = max(maxW, W[i]);
     float sumW = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) { om[i] = exp(W[i] - maxW); sumW += om[i]; }
     float invW = 1.0f / sumW;
-    [ForceUnroll] for (uint i = 0; i < K; i++) om[i] *= invW;
+    [ForceUnroll] for (uint i = 0; i < K; i++)
+        om[i] = kPQMinBinWidth + (1.0f - kPQMinBinWidth * float(K)) * om[i] * invW;
 
     // vertices: exp(V), normalised so ∫ pdf = Σ ω·(v_i+v_{i+1})/2 = 1
     float ev[K + 1u];
-    float maxV = V[0];
-    [ForceUnroll] for (uint i = 1; i < K + 1u; i++) maxV = max(maxV, V[i]);
+    float maxV = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K + 1u; i++) maxV = max(maxV, V[i]);
     [ForceUnroll] for (uint i = 0; i < K + 1u; i++) ev[i] = exp(V[i] - maxV);
     float denom = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) denom += 0.5f * (ev[i] + ev[i + 1]) * om[i];
     float invD = 1.0f / denom;
     float v[K + 1u];
-    [ForceUnroll] for (uint i = 0; i < K + 1u; i++) v[i] = ev[i] * invD;
+    // Floor as a convex combination with the all-ones field -- exact under the
+    // (now-floored-om) constraint above; see the header comment.
+    [ForceUnroll] for (uint i = 0; i < K + 1u; i++)
+        v[i] = kPQMinVertex + (1.0f - kPQMinVertex) * (ev[i] * invD);
 
     // cumulative width knots Ω and cumulative area (CDF at knots) cumA
     float cumOm[K + 1u];
@@ -85,22 +116,24 @@ FlowStep pqInverse<let K : uint>(float y, float W[K], float V[K + 1u], float tai
     if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float om[K];
-    float maxW = W[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxW = max(maxW, W[i]);
+    float maxW = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K; i++) maxW = max(maxW, W[i]);
     float sumW = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) { om[i] = exp(W[i] - maxW); sumW += om[i]; }
     float invW = 1.0f / sumW;
-    [ForceUnroll] for (uint i = 0; i < K; i++) om[i] *= invW;
+    [ForceUnroll] for (uint i = 0; i < K; i++)
+        om[i] = kPQMinBinWidth + (1.0f - kPQMinBinWidth * float(K)) * om[i] * invW;
 
     float ev[K + 1u];
-    float maxV = V[0];
-    [ForceUnroll] for (uint i = 1; i < K + 1u; i++) maxV = max(maxV, V[i]);
+    float maxV = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K + 1u; i++) maxV = max(maxV, V[i]);
     [ForceUnroll] for (uint i = 0; i < K + 1u; i++) ev[i] = exp(V[i] - maxV);
     float denom = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) denom += 0.5f * (ev[i] + ev[i + 1]) * om[i];
     float invD = 1.0f / denom;
     float v[K + 1u];
-    [ForceUnroll] for (uint i = 0; i < K + 1u; i++) v[i] = ev[i] * invD;
+    [ForceUnroll] for (uint i = 0; i < K + 1u; i++)
+        v[i] = kPQMinVertex + (1.0f - kPQMinVertex) * (ev[i] * invD);
 
     float cumOm[K + 1u];
     float cumA[K + 1u];

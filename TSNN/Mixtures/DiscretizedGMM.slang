@@ -1,5 +1,5 @@
 import TSNN.Mixtures.GaussianHelpers;
-import TSNN.Mixtures.TruncatedGMM; // Shared logSumExp and sampleSoftmax helpers.
+import TSNN.Mixtures.SoftmaxHelpers;
 import TSNN.Utils.PCG32;
 
 /**

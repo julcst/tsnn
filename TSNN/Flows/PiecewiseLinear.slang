@@ -15,6 +15,19 @@
 //
 // Packed parameter order is [q(K)].  Decode is inlined in each entry point for
 // the same autodiff-miscompile reason documented in RQS.slang.
+//
+// Bin-probability floor: a bare softmax(q) can drive any p[i] arbitrarily close
+// to 0 (a zero-initialised or adversarial conditioner will do this eventually).
+// log(max(pb*K, 1e-30)) (below) then falls off the 1e-30 cliff instead of
+// staying well-conditioned. Floored the same way RQS.slang floors its widths/
+// heights/derivatives (kRQSMinBinWidth etc.): a convex combination of the
+// uniform distribution and the softmax output,
+//   p[i] = kPLMinBinProb + (1 - kPLMinBinProb*K) * p[i]*invSum,
+// which keeps Sigma p == 1 exactly (both the floored and unfloored fields sum
+// to 1, and the combination is linear) while lower-bounding every bin at
+// kPLMinBinProb. That bounds log(p*K) below by log(kPLMinBinProb*K), demoting
+// the 1e-30 guards below to sanity nets that should never actually trigger.
+static const float kPLMinBinProb = 1e-3f;
 
 import TSNN.CoopVec;
 import TSNN.Flows.Bijection;
@@ -28,12 +41,21 @@ FlowStep plForward<let K : uint>(float x, float q[K], no_diff float tail)
 
     // bin probabilities via numerically-stable softmax
     float p[K];
-    float maxQ = q[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxQ = max(maxQ, q[i]);
+    // Seed from -inf and route EVERY index (including 0) through max(): seeding
+    // maxQ = q[0] directly and starting the loop at i=1 measurably drops the
+    // backward-mode gradient path into q[0] under this Slang version's autodiff
+    // (bwd_diff(...)(qPair,...) leaves qPair.d[0] at exactly 0 regardless of q,
+    // confirmed against central differences -- every other index gradients
+    // fine). Discovered while adding this file's own FD-vs-bwd_diff regression
+    // test (tests/piecewise/test_piecewise.py); RQS.slang has the same pattern
+    // and is presumed to share the defect -- see FINDING.md.
+    float maxQ = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K; i++) maxQ = max(maxQ, q[i]);
     float sum = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) { p[i] = exp(q[i] - maxQ); sum += p[i]; }
     float invSum = 1.0f / sum;
-    [ForceUnroll] for (uint i = 0; i < K; i++) p[i] = p[i] * invSum;
+    [ForceUnroll] for (uint i = 0; i < K; i++)
+        p[i] = kPLMinBinProb + (1.0f - kPLMinBinProb * float(K)) * p[i] * invSum;
 
     float span = 2.0f * tail;
     float w    = span / float(K);
@@ -61,12 +83,21 @@ FlowStep plInverse<let K : uint>(float y, float q[K], float tail)
     if (y <= -tail || y >= tail) { FlowStep r = { y, 0.0f }; return r; }
 
     float p[K];
-    float maxQ = q[0];
-    [ForceUnroll] for (uint i = 1; i < K; i++) maxQ = max(maxQ, q[i]);
+    // Seed from -inf and route EVERY index (including 0) through max(): seeding
+    // maxQ = q[0] directly and starting the loop at i=1 measurably drops the
+    // backward-mode gradient path into q[0] under this Slang version's autodiff
+    // (bwd_diff(...)(qPair,...) leaves qPair.d[0] at exactly 0 regardless of q,
+    // confirmed against central differences -- every other index gradients
+    // fine). Discovered while adding this file's own FD-vs-bwd_diff regression
+    // test (tests/piecewise/test_piecewise.py); RQS.slang has the same pattern
+    // and is presumed to share the defect -- see FINDING.md.
+    float maxQ = -1.0#INF;
+    [ForceUnroll] for (uint i = 0; i < K; i++) maxQ = max(maxQ, q[i]);
     float sum = 0.0f;
     [ForceUnroll] for (uint i = 0; i < K; i++) { p[i] = exp(q[i] - maxQ); sum += p[i]; }
     float invSum = 1.0f / sum;
-    [ForceUnroll] for (uint i = 0; i < K; i++) p[i] = p[i] * invSum;
+    [ForceUnroll] for (uint i = 0; i < K; i++)
+        p[i] = kPLMinBinProb + (1.0f - kPLMinBinProb * float(K)) * p[i] * invSum;
 
     float span = 2.0f * tail;
     float w    = span / float(K);

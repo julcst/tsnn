@@ -159,3 +159,39 @@ void ComposeEnc_bwd<int N1, int N2, int N3, int N4, int N5, int N6>(
     for(int i = 0; i < N6; i++) dA6[i] += dOutput[i + N1 + N2 + N3 + N4 + N5];
     a6 = diffPair(a6.p, dA6);
 }
+
+// Concatenate a CoopVec (the differentiable head) with a no_diff half[] tail into a fresh
+// CoopVec.  Every other primitive in this file takes half[] on BOTH sides -- this one exists
+// for a conditioner input built from a CoopVec that already came out of an upstream
+// differentiable computation (e.g. a trainable encoder's output), concatenated with a
+// constant per-sample encoding (a one-hot cell, a triangle-wave coordinate, ...).
+//
+// A CoopVecToArray(head) + ComposeCoop(...) round trip is NOT equivalent and must not be used
+// instead: the registered CoopVecFromArray/CoopVecToArray backward pair drops the incoming
+// differential rather than threading it through on this Slang/Vulkan backend, so `head`'s
+// upstream parameters (e.g. a hash-grid feature table) would silently stop receiving
+// gradient while the loss curve still looked plausible -- see
+// scripts/nisfit/NgrCompose.slang (this function's original, byte-identical home; duplicated
+// here so scripts/nisbench's arm modules can import it from TSNN directly without depending
+// on nisfit) and [[project_nis_hashgrid_grad_bugs]].
+[BackwardDerivative(ComposeCoopVecPlus_bwd)]
+CoopVec<half, N + M> ComposeCoopVecPlus<let N : int, let M : int>(
+    CoopVec<half, N> head, no_diff half[M] tail)
+{
+    CoopVec<half, N + M> output;
+    [ForceUnroll] for (int i = 0; i < N; ++i) output[i] = head[i];
+    [ForceUnroll] for (int i = 0; i < M; ++i) output[N + i] = tail[i];
+    return output;
+}
+
+// Fresh-output backward (not an inout accumulate) mirroring ComposeCoop3_bwd's pattern:
+// `head`'s differential is exactly the leading N lanes of dOutput; `tail` is no_diff, so it
+// carries no differential to write at all.
+void ComposeCoopVecPlus_bwd<let N : int, let M : int>(
+    inout DifferentialPair<CoopVec<half, N>> head, no_diff half[M] tail,
+    CoopVec<half, N + M> dOutput)
+{
+    CoopVec<half, N> dHead;
+    [ForceUnroll] for (int i = 0; i < N; ++i) dHead[i] = dOutput[i];
+    head = diffPair(head.p, dHead);
+}
