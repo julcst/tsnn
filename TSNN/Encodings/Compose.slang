@@ -184,14 +184,28 @@ CoopVec<half, N + M> ComposeCoopVecPlus<let N : int, let M : int>(
     return output;
 }
 
-// Fresh-output backward (not an inout accumulate) mirroring ComposeCoop3_bwd's pattern:
-// `head`'s differential is exactly the leading N lanes of dOutput; `tail` is no_diff, so it
-// carries no differential to write at all.
+// Accumulating backward, mirroring SetCoop_bwd/ComposeCoop_bwd/ComposeCoop3_bwd/ComposeEnc_bwd's
+// pattern: read the existing accumulated differential, add this call's contribution, write back
+// -- required so `head` (a CoopVec, unlike this file's other primitives whose primal parameters
+// are already plain half[]/Array<half,N>) accumulates correctly when consumed at more than one
+// call site inside a single [Differentiable] function body (see this function's own history:
+// it used to overwrite `head`'s differential outright, discarding whatever another consumer of
+// the SAME `head` value had already contributed -- see scripts/nisbench's FINDING.md).
+//
+// Routed through a PLAIN half[N] intermediate rather than any direct CoopVec-to-CoopVec
+// per-lane copy: `head.d[i]`/`dOutput[i]` (CoopVec -> scalar) and `dHead[i] = dHeadArr[i]`
+// (scalar/array -> CoopVec) are both the same primitive shape every other function in this file
+// already uses successfully; a fused CoopVec[i] = CoopVec[i] assignment inside a plain (not
+// [Differentiable]-transformed) function body was measured to silently produce garbage on this
+// Slang/Vulkan backend -- the SAME textual pattern compiles correctly inside ComposeCoopVecPlus's
+// own [Differentiable] forward above, but not here.
 void ComposeCoopVecPlus_bwd<let N : int, let M : int>(
     inout DifferentialPair<CoopVec<half, N>> head, no_diff half[M] tail,
     CoopVec<half, N + M> dOutput)
 {
+    half dHeadArr[N];
+    [ForceUnroll] for (int i = 0; i < N; ++i) dHeadArr[i] = head.d[i] + dOutput[i];
     CoopVec<half, N> dHead;
-    [ForceUnroll] for (int i = 0; i < N; ++i) dHead[i] = dOutput[i];
+    [ForceUnroll] for (int i = 0; i < N; ++i) dHead[i] = dHeadArr[i];
     head = diffPair(head.p, dHead);
 }
