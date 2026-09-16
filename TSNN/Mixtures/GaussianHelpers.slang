@@ -204,6 +204,7 @@ float logNormalCDFNonPositive(float z)
 [Differentiable]
 float logNormalCDF(float z)
 {
+    // WARNING: Potentially expensive branching
     if (z <= 0.0f)
         return logNormalCDFNonPositive(z);
     return log1mexp(logNormalCDFNonPositive(-z));
