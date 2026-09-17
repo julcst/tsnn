@@ -1,21 +1,12 @@
 import TSNN.CoopVec;
 import TSNN.LinearOps;
+
+import architectures.IArchitecture;
 import architectures.TMM;
 
 ByteAddressBuffer gParams;
 RWByteAddressBuffer gParamGrads;
 StructuredBuffer<float2> gSamples;
-
-// Keep the differentiated graph at module scope, as in examples/hggrid.  The
-// namespace remains the public architecture API for inference and setup.
-[Differentiable]
-float forward_TMM(MatrixBiasBuffer weights, no_diff float2 x)
-{
-    let ctx = TMM.makeContext();
-
-    let params = CoopVecToArray(TMM.kMLP.forward<TMM.Activation>(weights, ctx));
-    return TMM.kGMM.eval(params, x);
-}
 
 // A kernel entry point with scalar `uniform` parameters (as opposed to fields
 // inside a named cbuffer) reproducibly corrupts this environment's Vulkan
@@ -29,7 +20,7 @@ cbuffer TrainCB
 }
 
 [numthreads(256, 1, 1)]
-void trainNLL_TMM(uint3 tid : SV_DispatchThreadID)
+void trainNLL<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= gCount) return;
 
@@ -38,6 +29,15 @@ void trainNLL_TMM(uint3 tid : SV_DispatchThreadID)
 
     var wBuf = MatrixBiasBuffer(gParams);
     var wGrads = MatrixBiasBufferGrad(gParamGrads);
-    bwd_diff(forward_TMM)(
-        DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), sample, outputGrad);
+    bwd_diff(T.evalLogPDF)(DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), sample, outputGrad);
 }
+
+/// Generates trainNLL kernel for a given architecture.
+#define NDEBENCH_TRAIN_NLL_KERNEL(ARCHITECTURE) \
+    [numthreads(256, 1, 1)] \
+    void trainNLL_ ## ARCHITECTURE(uint3 tid : SV_DispatchThreadID) \
+    { \
+        trainNLL<ARCHITECTURE>(tid); \
+    }
+
+NDEBENCH_TRAIN_NLL_KERNEL(TMM)

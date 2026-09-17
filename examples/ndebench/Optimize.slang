@@ -2,6 +2,8 @@ import TSNN.Optimizers.Adam;
 import TSNN.Optimizers.Sanitizer;
 import TSNN.Utils.MLP;
 import TSNN.Encodings.FeatureBuffer;
+
+import architectures.IArchitecture;
 import architectures.TMM;
 
 /// float16 gradients written by train, read-only
@@ -55,6 +57,11 @@ cbuffer InitCB
     uint gInitThreadCount;
 }
 
+void init<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
+{
+    T.initParams<half, float>(gParamsInit, gParamsMasterInit, tid.x, gInitThreadCount);
+}
+
 // `optimize` is architecture-independent.  Only reset is specialized because
 // parameter initialization belongs to the architecture contract.
 // `TMM` becomes `init_TMM`.
@@ -62,7 +69,7 @@ cbuffer InitCB
     [numthreads(256, 1, 1)] \
     void init_ ## ARCHITECTURE(uint3 tid : SV_DispatchThreadID) \
     { \
-        ARCHITECTURE.initParams<half, float>(gParamsInit, gParamsMasterInit, tid.x, gInitThreadCount); \
+        init<ARCHITECTURE>(tid); \
     }
 
 NDEBENCH_RESET_KERNEL(TMM)
