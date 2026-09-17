@@ -3,6 +3,7 @@ import TSNN.LinearOps;
 
 import architectures.IArchitecture;
 import architectures.TMM;
+import architectures.HGGrid;
 
 ByteAddressBuffer gParams;
 RWByteAddressBuffer gParamGrads;
@@ -41,3 +42,4 @@ void trainNLL<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     }
 
 NDEBENCH_TRAIN_NLL_KERNEL(TMM)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGrid)

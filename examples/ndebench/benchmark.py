@@ -23,14 +23,28 @@ from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
+
+# Architectures wired into the NDEBENCH_*_KERNEL macros (one struct per
+# architectures/<name>.slang, implementing IArchitecture).
+ARCHITECTURES = ("TMM", "HGGrid")
+
+# Module and entry-point prefix each REGISTRY kind's kernel lives under,
+# mirroring the *_KERNEL macro invocations in the corresponding .slang file
+# (e.g. NDEBENCH_TRAIN_NLL_KERNEL(TMM) in TrainNLL.slang -> "trainNLL_TMM").
+KERNEL_SPECS = {
+    "metadata": ("Metadata.slang", "metadata"),
+    "init": ("Optimize.slang", "init"),
+    "train": ("TrainNLL.slang", "trainNLL"),
+    "eval": ("InferEval.slang", "inferEval"),
+    "sample": ("InferSample.slang", "inferSample"),
+}
+MODULE_BY_KIND = {kind: module for kind, (module, _prefix) in KERNEL_SPECS.items()}
+
+# Cartesian product of architecture x kernel kind, instead of a hand-written
+# per-architecture dict.
 REGISTRY = {
-    "TMM": {
-        "init": "init_TMM",
-        "train": "trainNLL_TMM",
-        "eval": "inferEval_TMM",
-        "sample": "inferSample_TMM",
-        "metadata": "metadata_TMM",
-    }
+    arch: {kind: f"{prefix}_{arch}" for kind, (_module, prefix) in KERNEL_SPECS.items()}
+    for arch in ARCHITECTURES
 }
 
 
@@ -164,8 +178,8 @@ class Runner:
     grid: object
     eval_out: object
     sample_out: object
-    elements: int
-    padded: int
+    elements_by_arch: dict[str, int]
+    padded_by_arch: dict[str, int]
     dispatch_threads: int
     grid_count: int
     width: int
@@ -245,7 +259,7 @@ class Runner:
             )
             self.kernels["optimize"].dispatch(
                 thread_count=[self.dispatch_threads, 1, 1],
-                vars=self.optimize_vars(step, lr, loss_scale, clip),
+                vars=self.optimize_vars(arch, step, lr, loss_scale, clip),
                 command_encoder=enc,
             )
             self.device.submit_command_buffer(enc.finish())
@@ -257,7 +271,9 @@ class Runner:
         self.device.wait()
         self.reset(arch)
 
-    def optimize_vars(self, step: int, lr: float, loss_scale: float, clip: float) -> dict:
+    def optimize_vars(
+        self, arch: str, step: int, lr: float, loss_scale: float, clip: float
+    ) -> dict:
         return {
             "gParams": self.params,
             "gParamsMaster": self.master,
@@ -269,7 +285,7 @@ class Runner:
                 "gCurrentStep": float(step),
                 "gLossScale": loss_scale,
                 "gGradClip": clip,
-                "gParamElementCount": self.padded,
+                "gParamElementCount": self.padded_by_arch[arch],
                 "gDispatchThreadCount": self.dispatch_threads,
             },
         }
@@ -283,6 +299,7 @@ def make_runner(
     grid: np.ndarray,
     batch_size: int,
     timing_workload: int,
+    architectures: list[str],
 ) -> Runner:
     options = spy.SlangCompilerOptions(
         {
@@ -298,24 +315,32 @@ def make_runner(
         )
 
     kernels = {
-        entry: load(module, entry)
-        for module, entry in [
-            ("Metadata.slang", "metadata_TMM"),
-            ("Optimize.slang", "init_TMM"),
-            ("Optimize.slang", "optimize"),
-            ("TrainNLL.slang", "trainNLL_TMM"),
-            ("InferEval.slang", "inferEval_TMM"),
-            ("InferSample.slang", "inferSample_TMM"),
-            ("ImageSample.slang", "sampleImage"),
-        ]
+        "optimize": load("Optimize.slang", "optimize"),
+        "sampleImage": load("ImageSample.slang", "sampleImage"),
     }
+    for arch in architectures:
+        for kind, entry in REGISTRY[arch].items():
+            kernels[entry] = load(MODULE_BY_KIND[kind], entry)
+
+    # Each architecture owns its own parameter-element count; buffers are
+    # sized to the largest one so every architecture's real weights fit,
+    # while gParamElementCount (in optimize_vars) stays per-architecture so
+    # the Adam sweep never walks past a smaller architecture's own tail.
     meta = buffer(device, np.zeros(1, np.uint32), 4)
-    kernels["metadata_TMM"].dispatch(thread_count=[1, 1, 1], vars={"gMetadata": meta})
-    device.wait()
-    elements = int(np.frombuffer(meta.to_numpy(), dtype=np.uint32)[0])
-    if elements <= 0:
-        raise RuntimeError("architecture metadata returned no parameters")
-    padded = aligned4(elements)
+    elements_by_arch: dict[str, int] = {}
+    padded_by_arch: dict[str, int] = {}
+    for arch in architectures:
+        kernels[REGISTRY[arch]["metadata"]].dispatch(
+            thread_count=[1, 1, 1], vars={"gMetadata": meta}
+        )
+        device.wait()
+        elements = int(np.frombuffer(meta.to_numpy(), dtype=np.uint32)[0])
+        if elements <= 0:
+            raise RuntimeError(f"architecture {arch!r} metadata returned no parameters")
+        elements_by_arch[arch] = elements
+        padded_by_arch[arch] = aligned4(elements)
+
+    padded = max(padded_by_arch.values())
     fp16_bytes = padded * 2
     fp32_bytes = padded * 4
     sample_out_count = max(batch_size, timing_workload)
@@ -333,8 +358,8 @@ def make_runner(
         buffer(device, np.ascontiguousarray(grid), grid.nbytes, rw=False),
         buffer(device, None, grid.shape[0] * 4),
         buffer(device, None, sample_out_count * 8),
-        elements,
-        padded,
+        elements_by_arch,
+        padded_by_arch,
         256 * 8,
         grid.shape[0],
         width,
@@ -495,7 +520,7 @@ def run_architecture(
                 r.kernels["optimize"].dispatch(
                     thread_count=[r.dispatch_threads, 1, 1],
                     vars=r.optimize_vars(
-                        step, args.learning_rate, args.loss_scale, args.gradient_clip
+                        arch, step, args.learning_rate, args.loss_scale, args.gradient_clip
                     ),
                     command_encoder=enc,
                 )
@@ -523,7 +548,10 @@ def run_architecture(
     )
     Image.fromarray(display, mode="L").save(output / f"{arch}_final_logpdf.png")
     return {
-        "metadata": {"parameter_elements_fp16": r.elements, "padded_parameter_elements": r.padded},
+        "metadata": {
+            "parameter_elements_fp16": r.elements_by_arch[arch],
+            "padded_parameter_elements": r.padded_by_arch[arch],
+        },
         "checkpoints": rows,
         "timing": {
             "mean_training_ms_per_update": total_train / step * 1000,
@@ -551,7 +579,11 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--image", type=Path, default=ROOT / "examples/einstein.png")
     p.add_argument("--batch-size", type=int, default=262144)  # Small batch size underoccupies GPU
-    p.add_argument("--architectures", default="TMM")
+    p.add_argument(
+        "--architectures",
+        default=",".join(ARCHITECTURES),
+        help=f"comma-separated architecture names; default is all: {', '.join(ARCHITECTURES)}",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--loss-scale", type=float, default=128.0)
@@ -603,7 +635,7 @@ def main() -> None:
     np.save(output / "reference_masses.npy", masses)
     np.save(output / "reference_logpdf.npy", reference_logpdf)
     r = make_runner(
-        marginal, conditional, width, height, grid, args.batch_size, args.timing_workload
+        marginal, conditional, width, height, grid, args.batch_size, args.timing_workload, names
     )
     if args.smoke:
         verify_sampler(r, masses, args.seed)

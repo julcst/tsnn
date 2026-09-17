@@ -3,6 +3,7 @@ import TSNN.LinearOps;
 
 import architectures.IArchitecture;
 import architectures.TMM;
+import architectures.HGGrid;
 
 ByteAddressBuffer gParams;
 StructuredBuffer<float2> gSamples;
@@ -24,3 +25,4 @@ void inferEval<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     }
 
 NDEBENCH_INFER_EVAL_KERNEL(TMM)
+NDEBENCH_INFER_EVAL_KERNEL(HGGrid)

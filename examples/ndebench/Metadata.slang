@@ -1,5 +1,6 @@
 import architectures.IArchitecture;
 import architectures.TMM;
+import architectures.HGGrid;
 
 RWStructuredBuffer<uint> gMetadata;
 
@@ -16,3 +17,4 @@ void metadata<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     }
 
 NDEBENCH_METADATA_KERNEL(TMM)
+NDEBENCH_METADATA_KERNEL(HGGrid)

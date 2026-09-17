@@ -9,7 +9,7 @@ import TSNN.Mixtures.TruncatedGMM;
 
 struct TMM : IArchitecture
 {
-    static constexpr const uint K = 8;
+    static constexpr const uint K = 16;
 
     typealias Net = MLP<1, 32, 3, K * 5>;
     typealias Activation = LeakyReLU;

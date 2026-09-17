@@ -5,6 +5,7 @@ import TSNN.Encodings.FeatureBuffer;
 
 import architectures.IArchitecture;
 import architectures.TMM;
+import architectures.HGGrid;
 
 /// float16 gradients written by train, read-only
 StructuredBuffer<half4> gParamGrads;
@@ -73,6 +74,7 @@ void init<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     }
 
 NDEBENCH_RESET_KERNEL(TMM)
+NDEBENCH_RESET_KERNEL(HGGrid)
 
 [numthreads(256, 1, 1)]
 void optimize(uint3 tid: SV_DispatchThreadID)

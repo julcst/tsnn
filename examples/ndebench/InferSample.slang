@@ -4,6 +4,7 @@ import TSNN.Utils.PCG32;
 
 import architectures.IArchitecture;
 import architectures.TMM;
+import architectures.HGGrid;
 
 ByteAddressBuffer gParams;
 RWStructuredBuffer<float2> gSamples;
@@ -34,3 +35,4 @@ void inferSample<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     }
 
 NDEBENCH_INFER_SAMPLE_KERNEL(TMM)
+NDEBENCH_INFER_SAMPLE_KERNEL(HGGrid)

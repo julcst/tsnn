@@ -13,11 +13,6 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 
 
-def clipped(values: np.ndarray, floor: float) -> np.ndarray:
-    """Display-only clipping: the saved arrays are intentionally untouched."""
-    return np.maximum(values, floor)
-
-
 def find_output_directory(parser: argparse.ArgumentParser) -> Path:
     """Newest results.json under HERE, else HERE/output (benchmark.py's default)."""
     candidates = [
@@ -39,7 +34,6 @@ def find_output_directory(parser: argparse.ArgumentParser) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output_directory", type=Path, nargs="?", default=None)
-    parser.add_argument("--logpdf-floor", type=float, default=-12.0)
     args = parser.parse_args()
     output = args.output_directory or find_output_directory(parser)
     report = json.loads((output / "results.json").read_text())
@@ -68,31 +62,25 @@ def main() -> None:
     fig.savefig(output / "nll.png", dpi=180)
     plt.close(fig)
 
-    models = {name: np.load(output / f"{name}_final_logpdf.npy") for name in architectures}
-    limits = (
-        args.logpdf_floor,
-        max(float(np.nanmax(reference)), *(float(np.nanmax(x)) for x in models.values())),
-    )
+    reference_pdf = np.exp(reference)
+    models = {
+        name: np.exp(np.load(output / f"{name}_final_logpdf.npy")) for name in architectures
+    }
+    vmax = max(float(np.nanmax(reference_pdf)), *(float(np.nanmax(x)) for x in models.values()))
     fig, axes = plt.subplots(
         1, len(models) + 1, figsize=(4 * (len(models) + 1), 4), constrained_layout=True
     )
     axes = np.atleast_1d(axes)
-    panels = [("reference", reference), *models.items()]
+    panels = [("reference", reference_pdf), *models.items()]
     image = None
     for axis, (name, values) in zip(axes, panels):
-        image = axis.imshow(
-            clipped(values, args.logpdf_floor),
-            origin="upper",
-            vmin=limits[0],
-            vmax=limits[1],
-            cmap="magma",
-        )
-        axis.set_title(f"{name} logPDF")
+        image = axis.imshow(values, origin="upper", vmin=0.0, vmax=vmax, cmap="magma")
+        axis.set_title(f"{name} PDF")
         axis.set_axis_off()
-    fig.colorbar(image, ax=axes, label="log density (display clipped)")
-    fig.savefig(output / "logpdf_panels.png", dpi=180)
+    fig.colorbar(image, ax=axes, label="density")
+    fig.savefig(output / "pdf_panels.png", dpi=180)
     plt.close(fig)
-    print(f"wrote {output / 'nll.png'} and {output / 'logpdf_panels.png'}")
+    print(f"wrote {output / 'nll.png'} and {output / 'pdf_panels.png'}")
 
 
 if __name__ == "__main__":
