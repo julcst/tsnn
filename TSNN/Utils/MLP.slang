@@ -116,7 +116,7 @@ struct MLP<
     // layout, since each block fills only its own logical slice.  The layout
     // (offsets/end) is defined in half slots, which equal the logical parameter
     // indices; the storage stride is sizeof(T).
-    void initParams<T : __BuiltinFloatingPointType>(
+    void initParams<T : IFloat>(
         RWByteAddressBuffer params, uint tid, uint threadCount,
         MLPInit scheme = MLPInit::HeNormal, bool zeroLastLayer = false)
     {
@@ -129,7 +129,7 @@ struct MLP<
     // Mixed-precision variant: writes a compute mirror (TMirror, e.g. half) and a
     // full-precision master (TMaster, e.g. float) from the same draw — Adam updates
     // the master, the mirror feeds the forward/backward compute.
-    void initParams<TMirror : __BuiltinFloatingPointType, TMaster : __BuiltinFloatingPointType>(
+    void initParams<TMirror : IFloat, TMaster : IFloat>(
         RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount,
         MLPInit scheme = MLPInit::HeNormal, bool zeroLastLayer = false)
     {

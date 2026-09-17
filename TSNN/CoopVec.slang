@@ -318,7 +318,6 @@ void CoopVecFromVector_bwd<T : __BuiltinFloatingPointType, let N : int>(
     v = diffPair(v.p, dv);
 }
 
-[BackwardDerivative(CoopVecToArray_bwd)]
 float[N] CoopVecToArray<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, N> v)
 {
     float arr[N];
@@ -328,6 +327,7 @@ float[N] CoopVecToArray<T : __BuiltinFloatingPointType, let N : int>(CoopVec<T, 
     return arr;
 }
 
+[BackwardDerivativeOf(CoopVecToArray)]
 void CoopVecToArray_bwd<T : __BuiltinFloatingPointType, let N : int>(
     inout DifferentialPair<CoopVec<T, N>> v,
     float arr[N])

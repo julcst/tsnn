@@ -1,0 +1,19 @@
+[project]
+name = "ndebench"
+version = "0.1.0"
+description = "Single-pass SlangPy neural density-estimation benchmark"
+requires-python = ">=3.13"
+dependencies = [
+    "slangpy>=0.42.0,<0.43",
+    "numpy>=2.4.6",
+    "Pillow>=12.3.0",
+    "matplotlib>=3.10.0",
+    "tqdm>=4.67.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.14.0,<0.15"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
