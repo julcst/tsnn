@@ -51,23 +51,28 @@ def load_image(path: Path) -> tuple[np.ndarray, int, int]:
     return masses / total, width, height
 
 
-def sample_stream(masses: np.ndarray, count: int, seed: int) -> np.ndarray:
-    if count < 1:
-        raise ValueError("sample count must be positive")
-    cdf = np.ascontiguousarray(np.cumsum(masses.ravel(), dtype=np.float64))
-    cdf[-1] = 1.0
-    if not np.isclose(cdf[-1], 1.0) or np.any(np.diff(cdf) < 0):
-        raise ValueError("invalid normalized CDF")
-    rng = np.random.default_rng(seed)
-    chosen = np.searchsorted(cdf, rng.random(count), side="right")
-    chosen = np.minimum(chosen, masses.size - 1)
-    row, col = np.divmod(chosen, masses.shape[1])
-    jitter = rng.random((count, 2))
-    points = np.empty((count, 2), dtype=np.float32)
-    points[:, 0] = (col + jitter[:, 0]) / masses.shape[1]
-    points[:, 1] = (row + jitter[:, 1]) / masses.shape[0]
-    # The cast must not convert a valid coordinate to precisely one.
-    return np.minimum(points, np.nextafter(np.float32(1), np.float32(0)))
+def image_distribution(masses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Marginal-over-rows + per-row-conditional-over-columns CDF decomposition.
+
+    A single flat CDF over all texels is unusable in float32 at einstein.png's
+    resolution (1.06e7 texels): mean texel mass (~9.4e-8) is below the ulp of
+    1.0 (6.0e-8), so roughly half the texels would collapse into zero-width
+    intervals and never be sampled. Splitting into a marginal over rows
+    (`height` entries) and a conditional over columns per row (`width`
+    entries), each spanning [0, 1], keeps step sizes around 1/height or
+    1/width -- far above the ulp.
+    """
+    row_mass = masses.sum(axis=1)
+    marginal = np.ascontiguousarray(np.cumsum(row_mass, dtype=np.float64))
+    marginal[-1] = 1.0
+    safe = np.where(row_mass > 0, row_mass, 1.0)  # zero-mass rows: avoid 0/0
+    conditional = np.ascontiguousarray(np.cumsum(masses, axis=1, dtype=np.float64) / safe[:, None])
+    conditional[:, -1] = 1.0
+    if not np.isclose(marginal[-1], 1.0) or np.any(np.diff(marginal) < 0):
+        raise ValueError("invalid normalized marginal CDF")
+    if np.any(np.diff(conditional, axis=1) < 0):
+        raise ValueError("invalid normalized conditional CDF")
+    return marginal.astype(np.float32), conditional.astype(np.float32)
 
 
 def texel_centers(width: int, height: int) -> np.ndarray:
@@ -87,28 +92,40 @@ def smoke_reduce(masses: np.ndarray, extent: int = 64) -> np.ndarray:
     return reduced / reduced.sum()
 
 
-def batches(total: int, batch_size: int):
-    for offset in range(0, total, batch_size):
-        yield offset, min(batch_size, total - offset)
-
-
 def validate() -> None:
     # Non-square orientation also catches x/y transposition in the sampler.
     masses = np.array([[0.0, 1.0, 0.0], [2.0, 0.0, 3.0]], dtype=np.float64)
     masses /= masses.sum()
-    points = sample_stream(masses, 4096, 9)
-    assert points.dtype == np.float32 and np.all((points >= 0) & (points < 1))
-    assert np.array_equal(points, sample_stream(masses, 4096, 9))
-    cdf = np.cumsum(masses.ravel())
-    cdf[-1] = 1.0
-    assert cdf[-1] == 1.0 and np.searchsorted(cdf, 0.0, side="right") == 1
+    marginal, conditional = image_distribution(masses)
+    assert marginal.dtype == np.float32 and conditional.dtype == np.float32
+    assert marginal.shape == (2,) and conditional.shape == (2, 3)
+    assert marginal[-1] == 1.0 and np.all(np.diff(marginal) >= 0)
+    assert np.all(conditional[:, -1] == 1.0) and np.all(np.diff(conditional, axis=1) >= 0)
+
+    # Zero-mass row: the safe-divide must avoid 0/0, and the row's marginal
+    # interval collapses to zero width so it can never be selected.
+    zero_row_masses = np.array([[0.0, 0.0], [1.0, 1.0]])
+    zero_marginal, zero_conditional = image_distribution(zero_row_masses)
+    assert np.all(np.isfinite(zero_conditional)) and zero_marginal[0] == 0.0
+
+    # Two-stage inversion mirror of the GPU sampler (upperBound == np.searchsorted
+    # side="right"): confirms it selects only the three non-zero texels with the
+    # right row/col orientation -- this is what currently guards against x/y
+    # transposition.
+    rng = np.random.default_rng(9)
+    u_row, u_col = rng.random(4096), rng.random(4096)
+    rows = np.clip(np.searchsorted(marginal, u_row, side="right"), 0, 1)
+    cols = np.empty(4096, dtype=np.int64)
+    for r in np.unique(rows):
+        mask = rows == r
+        cols[mask] = np.clip(np.searchsorted(conditional[r], u_col[mask], side="right"), 0, 2)
+    assert set(np.unique(rows * 3 + cols)) == {1, 3, 5}
+
     grid = texel_centers(3, 2).reshape(2, 3, 2)
     assert np.allclose(grid[0, :, 1], 0.25) and np.allclose(grid[:, 0, 0], 1 / 6)
     density = masses * 6
     assert np.isclose(density.sum() / 6, 1.0)
     assert np.count_nonzero(masses) == 3  # zero mass is excluded from NLL reduction
-    assert list(batches(10, 4)) == [(0, 4), (4, 4), (8, 2)]
-    assert list(batches(3, 8)) == [(0, 3)]
 
 
 def buffer(device: spy.Device, data: np.ndarray | None, nbytes: int, *, rw: bool = True):
@@ -142,6 +159,8 @@ class Runner:
     m1: object
     m2: object
     samples: object
+    marginal: object
+    conditional: object
     grid: object
     eval_out: object
     sample_out: object
@@ -149,7 +168,9 @@ class Runner:
     padded: int
     dispatch_threads: int
     grid_count: int
-    sample_count: int
+    width: int
+    height: int
+    batch_size: int
 
     def reset(self, arch: str) -> None:
         enc = self.device.create_command_encoder()
@@ -180,18 +201,37 @@ class Runner:
             raise FloatingPointError("model produced non-finite logPDF values")
         return values, elapsed
 
+    def generate(self, count: int, stream_offset: int, seed: int, encoder) -> None:
+        self.kernels["sampleImage"].dispatch(
+            thread_count=[count, 1, 1],
+            vars={
+                "gMarginalCDF": self.marginal,
+                "gConditionalCDF": self.conditional,
+                "gSamples": self.samples,
+                "ImageSampleCB": {
+                    "gWidth": self.width,
+                    "gHeight": self.height,
+                    "gCount": count,
+                    "gStreamOffset": stream_offset,
+                    "gSeed": seed,
+                },
+            },
+            command_encoder=encoder,
+        )
+
     def warm(
         self,
         arch: str,
-        batch: int,
         lr: float,
         loss_scale: float,
         clip: float,
         count: int,
+        seed: int,
     ) -> None:
-        n = min(batch, self.sample_count)
+        n = self.batch_size
         for step in range(1, count + 1):
             enc = self.device.create_command_encoder()
+            self.generate(n, (step - 1) * n, seed, enc)
             enc.clear_buffer(self.grads)
             self.kernels[REGISTRY[arch]["train"]].dispatch(
                 thread_count=[n, 1, 1],
@@ -199,7 +239,7 @@ class Runner:
                     "gParams": self.params,
                     "gParamGrads": self.grads,
                     "gSamples": self.samples,
-                    "TrainCB": {"gOffset": 0, "gCount": n, "gWeight": loss_scale / n},
+                    "TrainCB": {"gCount": n, "gWeight": loss_scale / n},
                 },
                 command_encoder=enc,
             )
@@ -235,7 +275,15 @@ class Runner:
         }
 
 
-def make_runner(samples: np.ndarray, grid: np.ndarray) -> Runner:
+def make_runner(
+    marginal: np.ndarray,
+    conditional: np.ndarray,
+    width: int,
+    height: int,
+    grid: np.ndarray,
+    batch_size: int,
+    timing_workload: int,
+) -> Runner:
     options = spy.SlangCompilerOptions(
         {
             "include_paths": [HERE, ROOT, ROOT / "TSNN", spy.SHADER_PATH],
@@ -258,6 +306,7 @@ def make_runner(samples: np.ndarray, grid: np.ndarray) -> Runner:
             ("TrainNLL.slang", "trainNLL_TMM"),
             ("InferEval.slang", "inferEval_TMM"),
             ("InferSample.slang", "inferSample_TMM"),
+            ("ImageSample.slang", "sampleImage"),
         ]
     }
     meta = buffer(device, np.zeros(1, np.uint32), 4)
@@ -269,6 +318,7 @@ def make_runner(samples: np.ndarray, grid: np.ndarray) -> Runner:
     padded = aligned4(elements)
     fp16_bytes = padded * 2
     fp32_bytes = padded * 4
+    sample_out_count = max(batch_size, timing_workload)
     return Runner(
         device,
         kernels,
@@ -277,16 +327,57 @@ def make_runner(samples: np.ndarray, grid: np.ndarray) -> Runner:
         buffer(device, None, fp16_bytes),
         buffer(device, None, fp32_bytes),
         buffer(device, None, fp32_bytes),
-        buffer(device, np.ascontiguousarray(samples), samples.nbytes, rw=False),
+        buffer(device, None, batch_size * 8),
+        buffer(device, np.ascontiguousarray(marginal), marginal.nbytes, rw=False),
+        buffer(device, np.ascontiguousarray(conditional), conditional.nbytes, rw=False),
         buffer(device, np.ascontiguousarray(grid), grid.nbytes, rw=False),
         buffer(device, None, grid.shape[0] * 4),
-        buffer(device, None, max(samples.shape[0], grid.shape[0]) * 8),
+        buffer(device, None, sample_out_count * 8),
         elements,
         padded,
         256 * 8,
         grid.shape[0],
-        samples.shape[0],
+        width,
+        height,
+        batch_size,
     )
+
+
+def verify_sampler(r: Runner, masses: np.ndarray, seed: int) -> None:
+    """One-shot GPU dispatch of sampleImage checked against the target masses.
+
+    The only end-to-end check that the GPU sampler reproduces the target
+    distribution (as opposed to the CPU-side image_distribution() asserts,
+    which never touch the GPU sampler itself).
+    """
+    count = 1 << 20
+    height, width = masses.shape
+    out = buffer(r.device, None, count * 8)
+    r.kernels["sampleImage"].dispatch(
+        thread_count=[count, 1, 1],
+        vars={
+            "gMarginalCDF": r.marginal,
+            "gConditionalCDF": r.conditional,
+            "gSamples": out,
+            "ImageSampleCB": {
+                "gWidth": width,
+                "gHeight": height,
+                "gCount": count,
+                "gStreamOffset": 0,
+                "gSeed": seed,
+            },
+        },
+    )
+    r.device.wait()
+    points = np.frombuffer(out.to_numpy(), dtype=np.float32).reshape(-1, 2)
+    hist, _, _ = np.histogram2d(
+        points[:, 1], points[:, 0], bins=[height, width], range=[[0.0, 1.0], [0.0, 1.0]]
+    )
+    hist /= hist.sum()
+    tv = 0.5 * float(np.abs(hist - masses).sum())
+    if tv >= 0.05:
+        raise FloatingPointError(f"GPU image sampler total-variation distance {tv:.4f} >= 0.05")
+    print(f"GPU sampler smoke check passed (total-variation distance {tv:.4f})")
 
 
 def timestamped_inference(
@@ -334,11 +425,11 @@ def run_architecture(
 ) -> dict:
     r.warm(
         arch,
-        args.batch_size,
         args.learning_rate,
         args.loss_scale,
         args.gradient_clip,
         args.warmup_count,
+        args.seed,
     )
     initial, grid_time = r.eval_grid(arch)
     h, w = masses.shape
@@ -369,44 +460,38 @@ def run_architecture(
             "grid_evaluation_seconds": grid_time,
         }
     )
-    total_train = total_clear = total_forward = total_opt = 0.0
+    total_generate = total_train = total_clear = total_forward = total_opt = 0.0
     step = 0
     total_consumed = 0
-    # `all_batches` slices the fixed, CPU-generated sample pool; training steps
-    # cycle through it rather than growing 1:1 with --samples, since
-    # sample_stream (numpy CDF search) is far slower than a GPU train step and
-    # would otherwise become the dominant cost as steps scale up (see the
-    # "data generation" diagnostic printed at the end of main()).
-    all_batches = list(batches(args.samples, args.batch_size))
     total_steps = args.steps
     with tqdm(total=total_steps, desc=f"{arch} train", unit="step") as pbar:
         while step < total_steps:
             group_size = min(args.evaluation_interval, total_steps - step)
-            group = [all_batches[(step + i) % len(all_batches)] for i in range(group_size)]
-            q = r.device.create_query_pool(spy.QueryType.timestamp, len(group) * 4)
+            q = r.device.create_query_pool(spy.QueryType.timestamp, group_size * 5)
             enc = r.device.create_command_encoder()
-            for i, (offset, count) in enumerate(group):
-                step += 1
-                total_consumed += count
-                base = i * 4
+            for i in range(group_size):
+                base = i * 5
                 enc.write_timestamp(q, base)
-                enc.clear_buffer(r.grads)
+                r.generate(r.batch_size, step * r.batch_size, args.seed, enc)
                 enc.write_timestamp(q, base + 1)
+                enc.clear_buffer(r.grads)
+                enc.write_timestamp(q, base + 2)
+                step += 1
+                total_consumed = step * r.batch_size
                 r.kernels[REGISTRY[arch]["train"]].dispatch(
-                    thread_count=[count, 1, 1],
+                    thread_count=[r.batch_size, 1, 1],
                     vars={
                         "gParams": r.params,
                         "gParamGrads": r.grads,
                         "gSamples": r.samples,
                         "TrainCB": {
-                            "gOffset": offset,
-                            "gCount": count,
-                            "gWeight": args.loss_scale / count,
+                            "gCount": r.batch_size,
+                            "gWeight": args.loss_scale / r.batch_size,
                         },
                     },
                     command_encoder=enc,
                 )
-                enc.write_timestamp(q, base + 2)
+                enc.write_timestamp(q, base + 3)
                 r.kernels["optimize"].dispatch(
                     thread_count=[r.dispatch_threads, 1, 1],
                     vars=r.optimize_vars(
@@ -414,17 +499,18 @@ def run_architecture(
                     ),
                     command_encoder=enc,
                 )
-                enc.write_timestamp(q, base + 3)
+                enc.write_timestamp(q, base + 4)
             r.device.submit_command_buffer(enc.finish())
             r.device.wait()
             stamps = (
-                np.asarray(q.get_results(0, len(group) * 4), dtype=np.uint64).reshape(-1, 4)
+                np.asarray(q.get_results(0, group_size * 5), dtype=np.uint64).reshape(-1, 5)
                 / r.device.info.timestamp_frequency
             )
-            total_clear += float(np.sum(stamps[:, 1] - stamps[:, 0]))
-            total_forward += float(np.sum(stamps[:, 2] - stamps[:, 1]))
-            total_opt += float(np.sum(stamps[:, 3] - stamps[:, 2]))
-            total_train += float(np.sum(stamps[:, 3] - stamps[:, 0]))
+            total_generate += float(np.sum(stamps[:, 1] - stamps[:, 0]))
+            total_clear += float(np.sum(stamps[:, 2] - stamps[:, 1]))
+            total_forward += float(np.sum(stamps[:, 3] - stamps[:, 2]))
+            total_opt += float(np.sum(stamps[:, 4] - stamps[:, 3]))
+            total_train += float(np.sum(stamps[:, 4] - stamps[:, 0]))
             row, final = checkpoint(step, total_consumed, total_train, 0.0)
             rows.append(row)
             pbar.update(group_size)
@@ -441,6 +527,7 @@ def run_architecture(
         "checkpoints": rows,
         "timing": {
             "mean_training_ms_per_update": total_train / step * 1000,
+            "sample_generation_seconds": total_generate,
             "gradient_clear_seconds": total_clear,
             "forward_backward_seconds": total_forward,
             "optimizer_seconds": total_opt,
@@ -463,11 +550,10 @@ def run_architecture(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--image", type=Path, default=ROOT / "examples/einstein.png")
-    p.add_argument("--samples", type=int, default=1 << 20)
-    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--batch-size", type=int, default=262144)  # Small batch size underoccupies GPU
     p.add_argument("--architectures", default="TMM")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--learning-rate", type=float, default=1e-2)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--loss-scale", type=float, default=128.0)
     p.add_argument("--gradient-clip", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=8192)
@@ -489,7 +575,6 @@ def main() -> None:
         p.error(f"unknown architectures {unknown}; supported: {', '.join(REGISTRY)}")
     if (
         min(
-            args.samples,
             args.batch_size,
             args.steps,
             args.evaluation_interval,
@@ -500,16 +585,16 @@ def main() -> None:
     ):
         p.error("counts must be positive")
     if args.smoke:
-        args.samples, args.batch_size, args.evaluation_interval = 32, 16, 1
+        args.batch_size, args.evaluation_interval = 16, 1
         args.timing_repetitions, args.timing_workload = 2, 16
         args.steps = 2
     masses, width, height = load_image(args.image)
     if args.smoke:
         masses = smoke_reduce(masses)
         height, width = masses.shape
-    gen_started = time.perf_counter()
-    stream = sample_stream(masses, args.samples, args.seed)
-    data_generation_seconds = time.perf_counter() - gen_started
+    cdf_started = time.perf_counter()
+    marginal, conditional = image_distribution(masses)
+    cdf_precompute_seconds = time.perf_counter() - cdf_started
     grid = texel_centers(width, height)
     output = args.output_directory
     output.mkdir(parents=True, exist_ok=True)
@@ -517,7 +602,11 @@ def main() -> None:
         reference_logpdf = np.where(masses > 0, np.log(masses * width * height), -np.inf)
     np.save(output / "reference_masses.npy", masses)
     np.save(output / "reference_logpdf.npy", reference_logpdf)
-    r = make_runner(stream, grid)
+    r = make_runner(
+        marginal, conditional, width, height, grid, args.batch_size, args.timing_workload
+    )
+    if args.smoke:
+        verify_sampler(r, masses, args.seed)
     report = {
         "configuration": vars(args) | {"image": str(args.image), "architectures": names},
         "image": {
@@ -527,29 +616,13 @@ def main() -> None:
         },
         "device": {"adapter": r.device.info.adapter_name, "backend": r.device.info.api_name},
         "versions": package_versions(),
-        "data_generation_seconds": data_generation_seconds,
+        "cdf_precompute_seconds": cdf_precompute_seconds,
         "architectures": {},
     }
     for name in names:
         report["architectures"][name] = run_architecture(r, name, masses, args, output)
     (output / "results.json").write_text(json.dumps(report, indent=2, default=str) + "\n")
     print(f"wrote {output / 'results.json'}")
-
-    total_gpu_train = sum(
-        a["timing"]["cumulative_training_seconds"] for a in report["architectures"].values()
-    )
-    print(
-        f"data generation (CPU): {data_generation_seconds * 1000:.1f} ms for {args.samples} "
-        f"samples ({args.samples / max(data_generation_seconds, 1e-9):.0f} samples/s) vs "
-        f"{total_gpu_train * 1000:.1f} ms cumulative GPU training time across {len(names)} "
-        f"architecture(s)"
-    )
-    if data_generation_seconds > total_gpu_train:
-        print(
-            "  -> CPU sample_stream() dominates GPU training time; --steps cycles the fixed "
-            "sample pool instead of regenerating data, so raising --steps does not add to "
-            "this cost. Raise --samples only if more unique data is actually needed."
-        )
 
 
 if __name__ == "__main__":

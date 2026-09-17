@@ -24,7 +24,6 @@ float forward_TMM(MatrixBiasBuffer weights, no_diff float2 x)
 // cbuffer already used by every other kernel in this file's siblings.
 cbuffer TrainCB
 {
-    uint  gOffset;
     uint  gCount;
     float gWeight;   // gLossScale / gBatchSize
 }
@@ -32,10 +31,9 @@ cbuffer TrainCB
 [numthreads(256, 1, 1)]
 void trainNLL_TMM(uint3 tid : SV_DispatchThreadID)
 {
-    let idx = gOffset + tid.x;
-    if (tid.x >= gCount || idx >= gSamples.getCount()) return;
+    if (tid.x >= gCount) return;
 
-    let sample = gSamples[idx];
+    let sample = gSamples[tid.x];
     float outputGrad = -gWeight;
 
     var wBuf = MatrixBiasBuffer(gParams);

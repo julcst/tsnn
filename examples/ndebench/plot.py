@@ -10,18 +10,38 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+HERE = Path(__file__).resolve().parent
+
 
 def clipped(values: np.ndarray, floor: float) -> np.ndarray:
     """Display-only clipping: the saved arrays are intentionally untouched."""
     return np.maximum(values, floor)
 
 
+def find_output_directory(parser: argparse.ArgumentParser) -> Path:
+    """Newest results.json under HERE, else HERE/output (benchmark.py's default)."""
+    candidates = [
+        p
+        for p in HERE.glob("**/results.json")
+        if not any(part.startswith(".") or part == "__pycache__" for part in p.parts)
+    ]
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime).parent
+    if (HERE / "output" / "results.json").exists():
+        return HERE / "output"
+    parser.error(
+        f"no results.json found under {HERE} (searched '**/results.json' and 'output/'); "
+        "run benchmark.py first or pass an explicit output directory"
+    )
+    raise AssertionError("unreachable")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_directory", type=Path)
+    parser.add_argument("output_directory", type=Path, nargs="?", default=None)
     parser.add_argument("--logpdf-floor", type=float, default=-12.0)
     args = parser.parse_args()
-    output = args.output_directory
+    output = args.output_directory or find_output_directory(parser)
     report = json.loads((output / "results.json").read_text())
     reference = np.load(output / "reference_logpdf.npy")
     entropy = -float(
