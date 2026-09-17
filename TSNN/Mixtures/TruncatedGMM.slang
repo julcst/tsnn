@@ -32,6 +32,8 @@ struct TruncatedGMM<uint N>
             let logWeight = input[offset + 0].toFloat(); // normalized weight
             let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat()); // uncontrained mean
             let logSigma = Output(input[offset + 3].toFloat(), input[offset + 4].toFloat()); // positive sigma
+            // TODO: test logSigma floor
+
             logits[i] = logWeight + logTruncGaussianPDF(x, mean, logSigma);
             logWeights[i] = logWeight;
         }

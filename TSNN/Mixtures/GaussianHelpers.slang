@@ -204,10 +204,14 @@ float logNormalCDFNonPositive(float z)
 [Differentiable]
 float logNormalCDF(float z)
 {
-    // WARNING: Potentially expensive branching
-    if (z <= 0.0f)
-        return logNormalCDFNonPositive(z);
-    return log1mexp(logNormalCDFNonPositive(-z));
+    // WARNING: Potential branching
+    // if (z <= 0.0f)
+    //     return logNormalCDFNonPositive(z);
+    // return log1mexp(logNormalCDFNonPositive(-z));
+
+    // Less branching variant:
+    let logCDFNegZ = logNormalCDFNonPositive(-abs(z));
+    return (z <= 0.0f) ? logCDFNegZ : log1mexp(logCDFNegZ);
 }
 
 [Differentiable]
