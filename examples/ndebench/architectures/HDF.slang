@@ -31,20 +31,28 @@ struct HDF : IArchitecture
     typealias FineNet   = MLP<kContextDim + kEncodedDim, 32, 3, kNumFineCells>;
     typealias Activation = LeakyReLU;
 
-    static constexpr const CoarseNet kCoarseMLP = CoarseNet(0u);
-    static constexpr const FineNet   kFineMLP   = FineNet(kCoarseMLP.end);
+    // Base indices into the host-supplied `Layout` buffer (see
+    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
+    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
+    // chained in declaration order, mirroring benchmark.py's own layout
+    // builder for this architecture.
+    static constexpr const uint kCoarseBase = 0u;
+    static constexpr const uint kFineBase = kCoarseBase + 4u;
 
-    static uint getParamCount() {
+    static CoarseNet makeCoarseNet(no_diff Layout layout) { return CoarseNet(layout, kCoarseBase); }
+    static FineNet makeFineNet(no_diff Layout layout) { return FineNet(layout, kFineBase); }
+
+    static uint getParamCount(no_diff Layout layout) {
         // `end` is a byte offset in the fp16 parameter layout; both MLPs are
         // chained into one buffer, so the fine MLP's end covers both blocks.
-        return kFineMLP.end / uint(sizeof(half));
+        return makeFineNet(layout).end / uint(sizeof(half));
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
-        RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount)
+        RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        kCoarseMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        kFineMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeCoarseNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeFineNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
     }
 
     static half[kEncodedDim] encodeCell(no_diff uint2 cell) {
@@ -62,14 +70,14 @@ struct HDF : IArchitecture
     }
 
     [Differentiable]
-    static float[kNumCoarseCells] forwardCoarse(MatrixBiasBuffer weights, Context ctx) {
-        return CoopVecToArray(kCoarseMLP.forward<Activation>(weights, ctx));
+    static float[kNumCoarseCells] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
+        return CoopVecToArray(makeCoarseNet(layout).forward<Activation>(weights, ctx));
     }
 
     [Differentiable]
-    static float[kNumFineCells] forwardFine(MatrixBiasBuffer weights, Context ctx, no_diff uint2 coarseCell) {
+    static float[kNumFineCells] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 coarseCell) {
         let input = ComposeCoopVecPlus(ctx, encodeCell(coarseCell));
-        let params = CoopVecToArray(kFineMLP.forward<Activation>(weights, input));
+        let params = CoopVecToArray(makeFineNet(layout).forward<Activation>(weights, input));
         return params;
     }
 
@@ -81,7 +89,7 @@ struct HDF : IArchitecture
     // density over x -- the same Jacobian HGGrid adds for its single-level
     // grid, doubled for HDF's two nested 8x subdivisions per axis.
     [Differentiable]
-    static float evalLogPDF(MatrixBiasBuffer weights, Context ctx, no_diff float2 x) {
+    static float evalLogPDF(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float2 x) {
         float2 xs = x * float(kCoarseDim);
         uint2 coarseCell = clamp(uint2(floor(xs)), uint2(0u), uint2(kCoarseDim - 1u));
         float2 t = xs - float2(coarseCell);
@@ -93,24 +101,24 @@ struct HDF : IArchitecture
         uint fineBin   = grid2bin(fineCell, kFineDim);
 
         Histogram<kNumCoarseCells> coarseHist;
-        let coarseLogits = forwardCoarse(weights, ctx);
+        let coarseLogits = forwardCoarse(weights, layout, ctx);
         float logCoarse = coarseHist.eval(coarseLogits, coarseBin);
 
         Histogram<kNumFineCells> fineHist;
-        let fineLogits = forwardFine(weights, ctx, coarseCell);
+        let fineLogits = forwardFine(weights, layout, ctx, coarseCell);
         float logFine = fineHist.eval(fineLogits, fineBin);
 
         return logCoarse + logFine + 2.0f * log(float(kFinestRes));
     }
 
-    static float2 sample(MatrixBiasBuffer weights, Context ctx, inout PCG32 rand) {
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand) {
         Histogram<kNumCoarseCells> coarseHist;
-        let coarseLogits = forwardCoarse(weights, ctx);
+        let coarseLogits = forwardCoarse(weights, layout, ctx);
         uint coarseBin = coarseHist.sample(coarseLogits, rand.nextFloat());
         uint2 coarseCell = bin2grid(coarseBin, kCoarseDim);
 
         Histogram<kNumFineCells> fineHist;
-        let fineLogits = forwardFine(weights, ctx, coarseCell);
+        let fineLogits = forwardFine(weights, layout, ctx, coarseCell);
         uint fineBin = fineHist.sample(fineLogits, rand.nextFloat());
         uint2 fineCell = bin2grid(fineBin, kFineDim);
 

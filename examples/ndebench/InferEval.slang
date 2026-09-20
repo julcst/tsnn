@@ -14,12 +14,13 @@ import architectures.HDF;
 ByteAddressBuffer gParams;
 StructuredBuffer<float2> gSamples;
 RWStructuredBuffer<float> gLogPDFs;
+StructuredBuffer<uint2> gLayout;
 
 void inferEval<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 {
     let idx = tid.x;
     if (idx >= gSamples.getCount()) return;
-    gLogPDFs[idx] = T.evalLogPDF(MatrixBiasBuffer(gParams), gSamples[idx]);
+    gLogPDFs[idx] = T.evalLogPDF(MatrixBiasBuffer(gParams), gLayout, gSamples[idx]);
 }
 
 /// Generates inferEval kernel for a given architecture.

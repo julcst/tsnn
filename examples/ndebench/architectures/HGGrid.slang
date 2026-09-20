@@ -25,21 +25,30 @@ struct HGGrid : IArchitecture
     typealias Activation = LeakyReLU;
     typealias GMM = TruncatedGMM<K>;
 
-    static constexpr const CoarseNet kCoarseMLP = CoarseNet(0u);
-    static constexpr const FineNet   kFineMLP   = FineNet(kCoarseMLP.end);
     static constexpr const GMM kGMM = GMM();
 
-    static uint getParamCount() {
+    // Base indices into the host-supplied `Layout` buffer (see
+    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
+    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
+    // chained in declaration order, mirroring benchmark.py's own layout
+    // builder for this architecture.
+    static constexpr const uint kCoarseBase = 0u;
+    static constexpr const uint kFineBase = kCoarseBase + 4u;
+
+    static CoarseNet makeCoarseNet(no_diff Layout layout) { return CoarseNet(layout, kCoarseBase); }
+    static FineNet makeFineNet(no_diff Layout layout) { return FineNet(layout, kFineBase); }
+
+    static uint getParamCount(no_diff Layout layout) {
         // `end` is a byte offset in the fp16 parameter layout; both MLPs are
         // chained into one buffer, so the fine MLP's end covers both blocks.
-        return kFineMLP.end / uint(sizeof(half));
+        return makeFineNet(layout).end / uint(sizeof(half));
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
-        RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount)
+        RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        kCoarseMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        kFineMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeCoarseNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeFineNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
     }
 
     static half[kEncodedDim] encodeCell(no_diff uint2 cell) {
@@ -57,14 +66,14 @@ struct HGGrid : IArchitecture
     }
 
     [Differentiable]
-    static float[kNumCells] forwardCoarse(MatrixBiasBuffer weights, Context ctx) {
-        return CoopVecToArray(kCoarseMLP.forward<Activation>(weights, ctx));
+    static float[kNumCells] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
+        return CoopVecToArray(makeCoarseNet(layout).forward<Activation>(weights, ctx));
     }
 
     [Differentiable]
-    static float[K * 5] forwardFine(MatrixBiasBuffer weights, Context ctx, no_diff uint2 cell) {
+    static float[K * 5] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 cell) {
         let input = ComposeCoopVecPlus(ctx, encodeCell(cell));
-        let params = CoopVecToArray(kFineMLP.forward<Activation>(weights, input));
+        let params = CoopVecToArray(makeFineNet(layout).forward<Activation>(weights, input));
         // Clip logSigma?
         return params;
     }
@@ -73,29 +82,29 @@ struct HGGrid : IArchitecture
     // (bin, t) -> x, mapping the unit square into a kGridDim x kGridDim grid
     // of unit cells, scales area by 1/kGridDim^2.
     [Differentiable]
-    static float evalLogPDF(MatrixBiasBuffer weights, Context ctx, no_diff float2 x) {
+    static float evalLogPDF(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float2 x) {
         float2 xs = x * float(kGridDim);
         uint2 cell = clamp(uint2(floor(xs)), uint2(0u), uint2(kGridDim - 1u));
         float2 t = xs - float2(cell);
         uint bin = grid2bin(cell, kGridDim);
 
         Histogram<kNumCells> hist;
-        let histLogits = forwardCoarse(weights, ctx);
+        let histLogits = forwardCoarse(weights, layout, ctx);
         float logHist = hist.eval(histLogits, bin);
 
-        let fineParams = forwardFine(weights, ctx, cell);
+        let fineParams = forwardFine(weights, layout, ctx, cell);
         float logFine = kGMM.eval(fineParams, t);
 
         return logHist + logFine + 2.0f * log(float(kGridDim));
     }
 
-    static float2 sample(MatrixBiasBuffer weights, Context ctx, inout PCG32 rand) {
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand) {
         Histogram<kNumCells> hist;
-        let histLogits = forwardCoarse(weights, ctx);
+        let histLogits = forwardCoarse(weights, layout, ctx);
         uint bin = hist.sample(histLogits, rand.nextFloat());
         uint2 cell = bin2grid(bin, kGridDim);
 
-        let fineParams = forwardFine(weights, ctx, cell);
+        let fineParams = forwardFine(weights, layout, ctx, cell);
         float2 t = kGMM.sample(fineParams, rand);
 
         return (float2(cell) + t) / float(kGridDim);

@@ -29,6 +29,7 @@ RWStructuredBuffer<float4> gMoments2;
 // byte-address stores.  Both aliases are bound to the same allocations.
 RWByteAddressBuffer gParamsInit;
 RWByteAddressBuffer gParamsMasterInit;
+StructuredBuffer<uint2> gLayout;
 
 #if DEBUG_COUNTERS
 // 4 × uint atomic: [0]=non-finite (overflow), [1]=clipped (saturation),
@@ -66,7 +67,7 @@ cbuffer InitCB
 
 void init<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 {
-    T.initParams<half, float>(gParamsInit, gParamsMasterInit, tid.x, gInitThreadCount);
+    T.initParams<half, float>(gParamsInit, gParamsMasterInit, gLayout, tid.x, gInitThreadCount);
 }
 
 // `optimize` is architecture-independent.  Only reset is specialized because

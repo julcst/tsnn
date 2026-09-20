@@ -35,21 +35,30 @@ struct NSFQuadratic : IArchitecture
     typealias CondMLP = MLP<kContextDim + kOneBlobBins, 32, 3, kSplineOut>;
     typealias Activation = LeakyReLU;
 
-    static constexpr const CondMLP kMLP0 = CondMLP(0u);
-    static constexpr const CondMLP kMLP1 = CondMLP(kMLP0.end);
     static const UniformPrior kPrior = UniformPrior(kDomain);
 
-    static uint getParamCount() {
+    // Base indices into the host-supplied `Layout` buffer (see
+    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
+    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
+    // chained in declaration order, mirroring benchmark.py's own layout
+    // builder for this architecture.
+    static constexpr const uint kMLP0Base = 0u;
+    static constexpr const uint kMLP1Base = kMLP0Base + 4u;
+
+    static CondMLP makeMLP0(no_diff Layout layout) { return CondMLP(layout, kMLP0Base); }
+    static CondMLP makeMLP1(no_diff Layout layout) { return CondMLP(layout, kMLP1Base); }
+
+    static uint getParamCount(no_diff Layout layout) {
         // `end` is a byte offset in the fp16 parameter layout; both MLPs are
         // chained into one buffer, so the second MLP's end covers both blocks.
-        return kMLP1.end / uint(sizeof(half));
+        return makeMLP1(layout).end / uint(sizeof(half));
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
-        RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount)
+        RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        kMLP0.initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        kMLP1.initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeMLP0(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeMLP1(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
     }
 
     // [ctx | oneBlob(coord)]: see NSFLinear.slang's condInput for the full
@@ -67,36 +76,36 @@ struct NSFQuadratic : IArchitecture
     }
 
     [Differentiable]
-    static float evalLogPDF(MatrixBiasBuffer weights, Context ctx, no_diff float2 x)
+    static float evalLogPDF(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float2 x)
     {
         float z0 = x.x - 0.5f;
         float z1 = x.y - 0.5f;
         float ld = 0.0f;
         {
-            let p = kMLP0.forward<Activation>(weights, condInput(ctx, z0));
+            let p = makeMLP0(layout).forward<Activation>(weights, condInput(ctx, z0));
             let r = pqForward<kNumBins>(z1, p, kDomain);
             z1 = r.value; ld += r.logAbsDet;
         }
         {
-            let p = kMLP1.forward<Activation>(weights, condInput(ctx, z1));
+            let p = makeMLP1(layout).forward<Activation>(weights, condInput(ctx, z1));
             let r = pqForward<kNumBins>(z0, p, kDomain);
             z0 = r.value; ld += r.logAbsDet;
         }
         return kPrior.logProb(float2(z0, z1)) + ld;
     }
 
-    static float2 sample(MatrixBiasBuffer weights, Context ctx, inout PCG32 rand)
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand)
     {
         float2 u01 = float2(rand.nextFloat(), rand.nextFloat());
         let z = kPrior.sample(u01);
         float x0 = z.x, x1 = z.y;
         {
-            let p = kMLP1.forward<Activation>(weights, condInput(ctx, x1));
+            let p = makeMLP1(layout).forward<Activation>(weights, condInput(ctx, x1));
             let r = pqInverse<kNumBins>(x0, p, kDomain);
             x0 = r.value;
         }
         {
-            let p = kMLP0.forward<Activation>(weights, condInput(ctx, x0));
+            let p = makeMLP0(layout).forward<Activation>(weights, condInput(ctx, x0));
             let r = pqInverse<kNumBins>(x1, p, kDomain);
             x1 = r.value;
         }

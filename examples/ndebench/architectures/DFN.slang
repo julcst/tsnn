@@ -22,29 +22,33 @@ struct DFN : IArchitecture
     typealias YNet   = MLP<kContextDim + kEncodedDim, kY, 3, kY>;
     typealias Activation = LeakyReLU;
 
-    static constexpr const XNet kXMLP = XNet(0u);
-    static constexpr const YNet kYMLP   = YNet(kXMLP.end);
+    // Base indices into the host-supplied `Layout` buffer (see
+    // IArchitecture.slang and TSNN.Utils.MLP's static from-layout methods'
+    // doc comment): each MLP contributes DEPTH+1 = 4 entries, chained in
+    // declaration order, mirroring benchmark.py's own layout builder for
+    // this architecture.
+    static constexpr const uint kXBase = 0u;
+    static constexpr const uint kYBase = kXBase + 4u;
 
-    static uint getParamCount() {
-        // `end` is a byte offset in the fp16 parameter layout; both MLPs are
-        // chained into one buffer, so the fine MLP's end covers both blocks.
-        return kYMLP.end / uint(sizeof(half));
+    static uint getParamCount(no_diff Layout layout) {
+        // YNet's end covers both blocks: both MLPs are chained into one buffer.
+        return YNet.paramCount(layout, kYBase);
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
-        RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount)
+        RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        kXMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        kYMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        XNet.initParams<TMirror, TMaster>(params, master, layout, kXBase, tid, threadCount);
+        YNet.initParams<TMirror, TMaster>(params, master, layout, kYBase, tid, threadCount);
     }
 
     [Differentiable]
-    static float[kX] forwardX(MatrixBiasBuffer weights, Context ctx) {
-        return CoopVecToArray(kXMLP.forward<Activation>(weights, ctx));
+    static float[kX] forwardX(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
+        return CoopVecToArray(XNet.forward<Activation>(weights, layout, kXBase, ctx));
     }
 
     [Differentiable]
-    static float[kY] forwardY(MatrixBiasBuffer weights, Context ctx, no_diff float x) {
+    static float[kY] forwardY(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float x) {
         // ComposeCoop needs half[] on both sides; encodeTriangleWave returns a
         // CoopVec, so route it through CoopVecToArray first (safe here: x is
         // no_diff data, not a learnable upstream feature, so there is no
@@ -57,7 +61,7 @@ struct DFN : IArchitecture
             enc[i] = half(encFloats[i]);
 
         let input = ComposeCoopVecPlus<kContextDim, kEncodedDim>(ctx, enc);
-        let params = CoopVecToArray(kYMLP.forward<Activation>(weights, input));
+        let params = CoopVecToArray(YNet.forward<Activation>(weights, layout, kYBase, input));
         return params;
     }
 
@@ -66,22 +70,22 @@ struct DFN : IArchitecture
     // continuous width 1/kX (resp. 1/kY), so converting to a density over x
     // needs the same per-axis resolution Jacobian HGGrid adds for its grid.
     [Differentiable]
-    static float evalLogPDF(MatrixBiasBuffer weights, Context ctx, no_diff float2 x) {
+    static float evalLogPDF(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float2 x) {
         uint2 cell = uint2(x * float2(kX, kY));
         var logPDF = 0.0f;
 
         Histogram<kX> histX;
-        let histXLogits = forwardX(weights, ctx);
+        let histXLogits = forwardX(weights, layout, ctx);
         logPDF += histX.eval(histXLogits, cell.x);
 
         Histogram<kY> histY;
-        let histYLogits = forwardY(weights, ctx, x.x);
+        let histYLogits = forwardY(weights, layout, ctx, x.x);
         logPDF += histY.eval(histYLogits, cell.y);
 
         return logPDF + log(float(kX)) + log(float(kY));
     }
 
-    static float2 sample(MatrixBiasBuffer weights, Context ctx, inout PCG32 rand) {
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand) {
         // histX.sample gives a discrete bin, not a continuous ε1 -- the density
         // is uniform WITHIN each bin (Eq. 4's piecewise-constant p(ε) = v[bin]),
         // so a real draw needs an independent uniform jitter within the chosen
@@ -90,12 +94,12 @@ struct DFN : IArchitecture
         // be jittered BEFORE conditioning forwardY, since Y|X is conditioned on
         // the continuous ε1, not on which bin it fell in.
         Histogram<kX> histX;
-        let histXLogits = forwardX(weights, ctx);
+        let histXLogits = forwardX(weights, layout, ctx);
         let binX = histX.sample(histXLogits, rand.nextFloat());
         let x = (float(binX) + rand.nextFloat()) / float(kX);
 
         Histogram<kY> histY;
-        let histYLogits = forwardY(weights, ctx, x);
+        let histYLogits = forwardY(weights, layout, ctx, x);
         let binY = histY.sample(histYLogits, rand.nextFloat());
         let y = (float(binY) + rand.nextFloat()) / float(kY);
 

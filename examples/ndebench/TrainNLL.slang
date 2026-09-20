@@ -14,6 +14,7 @@ import architectures.HDF;
 ByteAddressBuffer gParams;
 RWByteAddressBuffer gParamGrads;
 StructuredBuffer<float2> gSamples;
+StructuredBuffer<uint2> gLayout;
 
 // A kernel entry point with scalar `uniform` parameters (as opposed to fields
 // inside a named cbuffer) reproducibly corrupts this environment's Vulkan
@@ -36,7 +37,7 @@ void trainNLL<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 
     var wBuf = MatrixBiasBuffer(gParams);
     var wGrads = MatrixBiasBufferGrad(gParamGrads);
-    bwd_diff(T.evalLogPDF)(DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), sample, outputGrad);
+    bwd_diff(T.evalLogPDF)(DifferentialPtrPair<MatrixBiasBuffer>(wBuf, wGrads), gLayout, sample, outputGrad);
 }
 
 /// Generates trainNLL kernel for a given architecture.

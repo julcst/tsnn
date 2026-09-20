@@ -14,6 +14,7 @@ import architectures.HDF;
 
 ByteAddressBuffer gParams;
 RWStructuredBuffer<float2> gSamples;
+StructuredBuffer<uint2> gLayout;
 
 // A lone scalar `uniform` shader-entry-point parameter (as opposed to a named
 // cbuffer field) reproducibly hangs the GPU on the dispatch *following* it --
@@ -29,7 +30,7 @@ void inferSample<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
     uint idx = tid.x;
     if (idx >= gSamples.getCount()) return;
     var rand = PCG32(gSeed, idx);
-    gSamples[idx] = T.sample(MatrixBiasBuffer(gParams), rand);
+    gSamples[idx] = T.sample(MatrixBiasBuffer(gParams), gLayout, rand);
 }
 
 /// Generates inferSample kernel for a given architecture.

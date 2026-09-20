@@ -54,6 +54,67 @@ def aligned4(n: int) -> int:
     return (n + 3) & ~3
 
 
+# Per-architecture MLP shapes as (input, hidden, depth, output), one tuple per
+# TSNN.Utils.MLP<> block, in the same order each architecture's own .slang
+# file chains them (e.g. DFN's XNet then YNet). Mirrors the `typealias ... =
+# MLP<...>` lines in examples/ndebench/architectures/*.slang -- kept in sync
+# by hand since Slang has no host-side reflection for this; a mismatch here
+# throws in compute_layout's caller (the cross-check against the shader's own
+# getParamCount(), see make_runner) rather than silently mis-sizing buffers.
+MLP_LAYOUTS: dict[str, list[tuple[int, int, int, int]]] = {
+    "TMM": [(1, 32, 3, 16 * 5)],  # Net: K=16
+    "HGGrid": [(1, 32, 3, 64), (1 + 16, 32, 3, 4 * 5)],  # CoarseNet, FineNet: K=4
+    "DFN": [(1, 32, 3, 32), (1 + 12, 32, 3, 32)],  # XNet, YNet
+    "DFL": [(1, 32, 3, 32), (1 + 12, 32, 3, 32)],  # XNet, YNet
+    "NSFLinear": [(1 + 32, 32, 3, 16), (1 + 32, 32, 3, 16)],  # kMLP0, kMLP1
+    "NSFQuadratic": [(1 + 32, 32, 3, 33), (1 + 32, 32, 3, 33)],  # kSplineOut = 2*16+1
+    "NSFRQS": [(1 + 32, 32, 3, 47), (1 + 32, 32, 3, 47)],  # kSplineOut = 3*16-1
+    "HDF": [(1, 32, 3, 64), (1 + 16, 32, 3, 64)],  # CoarseNet, FineNet
+}
+
+
+def compute_layout(device: spy.Device, mlp_specs: list[tuple[int, int, int, int]]) -> tuple[np.ndarray, int]:
+    """Per-layer (weightOffset, biasOffset) byte pairs for a chain of MLPs,
+    mirroring TSNN.Utils.MLP's __init -- except each layer's WEIGHT matrix is
+    sized via Device.get_coop_vec_matrix_size(TrainingOptimal) instead of the
+    naive `sizeof(half) * inSize * outSize` that __init itself uses.
+
+    That naive size is only correct for RowMajor. `coopVecOuterProductAccumulate`
+    (the backward pass's gradient scatter, see TrainNLL.slang) requires
+    TrainingOptimal on current hardware -- the Slang stdlib's own doc comment
+    on it says so -- and TrainingOptimal's real per-matrix byte size is
+    device-defined (there is no shader-side equivalent of this query), and can
+    be well above the naive count (e.g. on this GPU a 32x32 fp16 matrix needs
+    3584 bytes vs. 2048 naive; a 32x1 needs 512 vs. 64). Using the naive size
+    to lay out a TrainingOptimal buffer silently under-allocates every layer,
+    which was the actual root cause of the "DFN/DFL lower half washed out"
+    bug -- see FINDING.md's "ndebench: DFN/DFL's lower ~47% of rows..." entry
+    and its follow-up. Bias vectors are never TrainingOptimal-reordered/padded
+    (only matrices are), so they keep the naive size unchanged.
+
+    Returns (flat uint32 array of interleaved (weightOffset, biasOffset)
+    pairs -- one per layer, MLPs concatenated in `mlp_specs` order, suitable
+    for a `StructuredBuffer<uint2>` -- and the total size in fp16 half-units,
+    matching what IArchitecture.getParamCount() reports for the same layout).
+    """
+    offsets: list[tuple[int, int]] = []
+    byte_off = 0
+    for input_dim, hidden, depth, output in mlp_specs:
+        for l in range(depth + 1):
+            in_size = input_dim if l == 0 else hidden
+            out_size = output if l == depth else hidden
+            weight_off = byte_off
+            wsize = device.get_coop_vec_matrix_size(
+                out_size, in_size, spy.CoopVecMatrixLayout.training_optimal, spy.DataType.float16
+            )
+            byte_off = aligned4(byte_off + wsize)
+            bias_off = byte_off
+            byte_off = aligned4(byte_off + out_size * 2)  # bias: plain fp16 vector
+            offsets.append((weight_off, bias_off))
+    flat = np.array(offsets, dtype=np.uint32).reshape(-1)
+    return flat, byte_off // 2
+
+
 def load_image(path: Path) -> tuple[np.ndarray, int, int]:
     """Return normalized native-resolution image masses, width, and height."""
     rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
@@ -182,6 +243,7 @@ class Runner:
     sample_out: object
     elements_by_arch: dict[str, int]
     padded_by_arch: dict[str, int]
+    layout_by_arch: dict[str, object]
     dispatch_threads: int
     grid_count: int
     width: int
@@ -198,6 +260,7 @@ class Runner:
             vars={
                 "gParamsInit": self.params,
                 "gParamsMasterInit": self.master,
+                "gLayout": self.layout_by_arch[arch],
                 "InitCB": {"gInitThreadCount": self.dispatch_threads},
             },
             command_encoder=enc,
@@ -209,7 +272,12 @@ class Runner:
         started = time.perf_counter()
         self.kernels[REGISTRY[arch]["eval"]].dispatch(
             thread_count=[self.grid_count, 1, 1],
-            vars={"gParams": self.params, "gSamples": self.grid, "gLogPDFs": self.eval_out},
+            vars={
+                "gParams": self.params,
+                "gSamples": self.grid,
+                "gLogPDFs": self.eval_out,
+                "gLayout": self.layout_by_arch[arch],
+            },
         )
         self.device.wait()
         elapsed = time.perf_counter() - started
@@ -249,6 +317,82 @@ class Runner:
             command_encoder=encoder,
         )
 
+    def train_group(
+        self,
+        arch: str,
+        step: int,
+        group_size: int,
+        lr: float,
+        loss_scale: float,
+        clip: float,
+        seed: int,
+    ) -> dict:
+        """Runs `group_size` train+optimize steps for `arch`, batched into
+        one command encoder with a GPU-timestamp query pool spanning the
+        whole group (generate/clear/forward/optimize each bracketed by a
+        timestamp write) -- this is the exact structure the equal-time
+        training loop in `run_architecture` measures per checkpoint, and
+        `warm()` below calls this too instead of its own one-command-buffer-
+        per-step loop it used to run. Batching group_size dispatches (with
+        their query-pool writes) into a single encoder is a different code
+        path from `warm()`'s old per-step submission pattern, and whatever
+        the driver needs to JIT/allocate for it apparently isn't triggered
+        by the old pattern: the first *measured* checkpoint group of every
+        run cost 1.3-2x more GPU time than every later group at the same
+        size, which is what made the KL-vs-GPU-seconds plot's curves appear
+        to start at scattered, offset x-positions (see FINDING.md). Sharing
+        this method means warmup and measurement can no longer drift apart
+        the same way again.
+
+        Returns this group's new `step`, cumulative `samples_consumed`, and
+        its own (generate, clear, forward, optimizer, total) GPU-second
+        deltas -- `run_architecture`'s checkpoint() wants the running totals,
+        `warm()` only cares that the call happened.
+        """
+        q = self.device.create_query_pool(spy.QueryType.timestamp, group_size * 5)
+        enc = self.device.create_command_encoder()
+        for i in range(group_size):
+            base = i * 5
+            enc.write_timestamp(q, base)
+            self.generate(self.batch_size, step * self.batch_size, seed, enc)
+            enc.write_timestamp(q, base + 1)
+            enc.clear_buffer(self.grads)
+            enc.write_timestamp(q, base + 2)
+            step += 1
+            self.kernels[REGISTRY[arch]["train"]].dispatch(
+                thread_count=[self.batch_size, 1, 1],
+                vars={
+                    "gParams": self.params,
+                    "gParamGrads": self.grads,
+                    "gSamples": self.samples,
+                    "gLayout": self.layout_by_arch[arch],
+                    "TrainCB": {"gCount": self.batch_size, "gWeight": loss_scale / self.batch_size},
+                },
+                command_encoder=enc,
+            )
+            enc.write_timestamp(q, base + 3)
+            self.kernels["optimize"].dispatch(
+                thread_count=[self.dispatch_threads, 1, 1],
+                vars=self.optimize_vars(arch, step, lr, loss_scale, clip),
+                command_encoder=enc,
+            )
+            enc.write_timestamp(q, base + 4)
+        self.device.submit_command_buffer(enc.finish())
+        self.device.wait()
+        stamps = (
+            np.asarray(q.get_results(0, group_size * 5), dtype=np.uint64).reshape(-1, 5)
+            / self.device.info.timestamp_frequency
+        )
+        return {
+            "step": step,
+            "samples_consumed": step * self.batch_size,
+            "generate": float(np.sum(stamps[:, 1] - stamps[:, 0])),
+            "clear": float(np.sum(stamps[:, 2] - stamps[:, 1])),
+            "forward": float(np.sum(stamps[:, 3] - stamps[:, 2])),
+            "optimizer": float(np.sum(stamps[:, 4] - stamps[:, 3])),
+            "total": float(np.sum(stamps[:, 4] - stamps[:, 0])),
+        }
+
     def warm(
         self,
         arch: str,
@@ -256,33 +400,27 @@ class Runner:
         loss_scale: float,
         clip: float,
         count: int,
+        group_size: int,
         seed: int,
     ) -> None:
-        n = self.batch_size
-        for step in range(1, count + 1):
-            enc = self.device.create_command_encoder()
-            self.generate(n, (step - 1) * n, seed, enc)
-            enc.clear_buffer(self.grads)
-            self.kernels[REGISTRY[arch]["train"]].dispatch(
-                thread_count=[n, 1, 1],
-                vars={
-                    "gParams": self.params,
-                    "gParamGrads": self.grads,
-                    "gSamples": self.samples,
-                    "TrainCB": {"gCount": n, "gWeight": loss_scale / n},
-                },
-                command_encoder=enc,
-            )
-            self.kernels["optimize"].dispatch(
-                thread_count=[self.dispatch_threads, 1, 1],
-                vars=self.optimize_vars(arch, step, lr, loss_scale, clip),
-                command_encoder=enc,
-            )
-            self.device.submit_command_buffer(enc.finish())
+        # At least one full group_size-sized group, batched via train_group
+        # (see its doc comment) -- quantizing warmup to whole groups matters
+        # more than hitting `count` exactly, since the point is exercising
+        # the real loop's own checkpoint-group shape at production size, not
+        # a specific step count (warm()'s work is thrown away by reset()
+        # below regardless).
+        step = 0
+        while step < max(count, group_size):
+            step = self.train_group(arch, step, group_size, lr, loss_scale, clip, seed)["step"]
         self.eval_grid(arch)
         self.kernels[REGISTRY[arch]["sample"]].dispatch(
-            thread_count=[n, 1, 1],
-            vars={"gParams": self.params, "gSamples": self.sample_out, "SampleCB": {"gSeed": 1}},
+            thread_count=[self.batch_size, 1, 1],
+            vars={
+                "gParams": self.params,
+                "gSamples": self.sample_out,
+                "gLayout": self.layout_by_arch[arch],
+                "SampleCB": {"gSeed": 1},
+            },
         )
         self.device.wait()
         self.reset(arch)
@@ -338,21 +476,41 @@ def make_runner(
         for kind, entry in REGISTRY[arch].items():
             kernels[entry] = load(MODULE_BY_KIND[kind], entry)
 
+    # Each architecture's per-layer buffer offsets (see compute_layout's doc
+    # comment) are computed host-side, once, from the device's own reported
+    # TrainingOptimal matrix sizes -- Slang has no way to query these itself.
+    layout_by_arch: dict[str, object] = {}
+    elements_by_layout: dict[str, int] = {}
+    for arch in architectures:
+        flat, elements = compute_layout(device, MLP_LAYOUTS[arch])
+        layout_by_arch[arch] = buffer(device, flat, flat.nbytes, rw=False)
+        elements_by_layout[arch] = elements
+
     # Each architecture owns its own parameter-element count; buffers are
     # sized to the largest one so every architecture's real weights fit,
     # while gParamElementCount (in optimize_vars) stays per-architecture so
     # the Adam sweep never walks past a smaller architecture's own tail.
+    # The metadata kernel re-derives the same count from `gLayout` on the
+    # shader side (T.getParamCount(layout), see IArchitecture.slang) -- kept
+    # as a live cross-check that MLP_LAYOUTS above hasn't drifted from the
+    # corresponding architectures/*.slang file's own MLP<> typealiases.
     meta = buffer(device, np.zeros(1, np.uint32), 4)
     elements_by_arch: dict[str, int] = {}
     padded_by_arch: dict[str, int] = {}
     for arch in architectures:
         kernels[REGISTRY[arch]["metadata"]].dispatch(
-            thread_count=[1, 1, 1], vars={"gMetadata": meta}
+            thread_count=[1, 1, 1], vars={"gMetadata": meta, "gLayout": layout_by_arch[arch]}
         )
         device.wait()
         elements = int(np.frombuffer(meta.to_numpy(), dtype=np.uint32)[0])
         if elements <= 0:
             raise RuntimeError(f"architecture {arch!r} metadata returned no parameters")
+        if elements != elements_by_layout[arch]:
+            raise RuntimeError(
+                f"architecture {arch!r}: MLP_LAYOUTS gives {elements_by_layout[arch]} fp16 "
+                f"elements but the shader's own getParamCount(gLayout) reports {elements} -- "
+                "MLP_LAYOUTS has drifted from this architecture's .slang file's MLP<> shapes"
+            )
         elements_by_arch[arch] = elements
         padded_by_arch[arch] = aligned4(elements)
 
@@ -376,6 +534,7 @@ def make_runner(
         buffer(device, None, sample_out_count * 8),
         elements_by_arch,
         padded_by_arch,
+        layout_by_arch,
         256 * 8,
         grid.shape[0],
         width,
@@ -428,20 +587,31 @@ def timestamped_inference(
     key = REGISTRY[arch][kind]
     input_buf = r.grid if kind == "eval" else r.sample_out
     output_buf = r.eval_out if kind == "eval" else r.sample_out
+    layout = r.layout_by_arch[arch]
     for i in range(5):
         vars_ = (
-            {"gParams": r.params, "gSamples": input_buf, "gLogPDFs": output_buf}
+            {"gParams": r.params, "gSamples": input_buf, "gLogPDFs": output_buf, "gLayout": layout}
             if kind == "eval"
-            else {"gParams": r.params, "gSamples": output_buf, "SampleCB": {"gSeed": seed + i}}
+            else {
+                "gParams": r.params,
+                "gSamples": output_buf,
+                "gLayout": layout,
+                "SampleCB": {"gSeed": seed + i},
+            }
         )
         r.kernels[key].dispatch(thread_count=[workload, 1, 1], vars=vars_)
     r.device.wait()
     q = r.device.create_query_pool(spy.QueryType.timestamp, repeats * 2)
     for i in range(repeats):
         vars_ = (
-            {"gParams": r.params, "gSamples": input_buf, "gLogPDFs": output_buf}
+            {"gParams": r.params, "gSamples": input_buf, "gLogPDFs": output_buf, "gLayout": layout}
             if kind == "eval"
-            else {"gParams": r.params, "gSamples": output_buf, "SampleCB": {"gSeed": seed + i}}
+            else {
+                "gParams": r.params,
+                "gSamples": output_buf,
+                "gLayout": layout,
+                "SampleCB": {"gSeed": seed + i},
+            }
         )
         r.kernels[key].dispatch(
             thread_count=[workload, 1, 1],
@@ -489,14 +659,20 @@ def sample_importance_ratio_variance(
     degenerate draws erase the signal from the rest.
     """
     n = min(count, r.sample_out_count)
+    layout = r.layout_by_arch[arch]
     r.kernels[REGISTRY[arch]["sample"]].dispatch(
         thread_count=[n, 1, 1],
-        vars={"gParams": r.params, "gSamples": r.sample_out, "SampleCB": {"gSeed": seed}},
+        vars={
+            "gParams": r.params,
+            "gSamples": r.sample_out,
+            "gLayout": layout,
+            "SampleCB": {"gSeed": seed},
+        },
     )
     r.device.wait()
     r.kernels[REGISTRY[arch]["eval"]].dispatch(
         thread_count=[n, 1, 1],
-        vars={"gParams": r.params, "gSamples": r.sample_out, "gLogPDFs": r.eval_out},
+        vars={"gParams": r.params, "gSamples": r.sample_out, "gLogPDFs": r.eval_out, "gLayout": layout},
     )
     r.device.wait()
     xy = np.frombuffer(r.sample_out.to_numpy(), dtype=np.float32).reshape(-1, 2)[:n]
@@ -540,6 +716,7 @@ def run_architecture(
         args.loss_scale,
         args.gradient_clip,
         args.warmup_count,
+        args.evaluation_interval,
         args.seed,
     )
     initial, grid_time = r.eval_grid(arch)
@@ -633,50 +810,22 @@ def run_architecture(
                 if total_train >= args.seconds_per_method:
                     break
                 group_size = args.evaluation_interval
-            q = r.device.create_query_pool(spy.QueryType.timestamp, group_size * 5)
-            enc = r.device.create_command_encoder()
-            for i in range(group_size):
-                base = i * 5
-                enc.write_timestamp(q, base)
-                r.generate(r.batch_size, step * r.batch_size, args.seed, enc)
-                enc.write_timestamp(q, base + 1)
-                enc.clear_buffer(r.grads)
-                enc.write_timestamp(q, base + 2)
-                step += 1
-                total_consumed = step * r.batch_size
-                r.kernels[REGISTRY[arch]["train"]].dispatch(
-                    thread_count=[r.batch_size, 1, 1],
-                    vars={
-                        "gParams": r.params,
-                        "gParamGrads": r.grads,
-                        "gSamples": r.samples,
-                        "TrainCB": {
-                            "gCount": r.batch_size,
-                            "gWeight": args.loss_scale / r.batch_size,
-                        },
-                    },
-                    command_encoder=enc,
-                )
-                enc.write_timestamp(q, base + 3)
-                r.kernels["optimize"].dispatch(
-                    thread_count=[r.dispatch_threads, 1, 1],
-                    vars=r.optimize_vars(
-                        arch, step, args.learning_rate, args.loss_scale, args.gradient_clip
-                    ),
-                    command_encoder=enc,
-                )
-                enc.write_timestamp(q, base + 4)
-            r.device.submit_command_buffer(enc.finish())
-            r.device.wait()
-            stamps = (
-                np.asarray(q.get_results(0, group_size * 5), dtype=np.uint64).reshape(-1, 5)
-                / r.device.info.timestamp_frequency
+            result = r.train_group(
+                arch,
+                step,
+                group_size,
+                args.learning_rate,
+                args.loss_scale,
+                args.gradient_clip,
+                args.seed,
             )
-            total_generate += float(np.sum(stamps[:, 1] - stamps[:, 0]))
-            total_clear += float(np.sum(stamps[:, 2] - stamps[:, 1]))
-            total_forward += float(np.sum(stamps[:, 3] - stamps[:, 2]))
-            total_opt += float(np.sum(stamps[:, 4] - stamps[:, 3]))
-            total_train += float(np.sum(stamps[:, 4] - stamps[:, 0]))
+            step = result["step"]
+            total_consumed = result["samples_consumed"]
+            total_generate += result["generate"]
+            total_clear += result["clear"]
+            total_forward += result["forward"]
+            total_opt += result["optimizer"]
+            total_train += result["total"]
             row, final = checkpoint(step, total_consumed, total_train, 0.0)
             rows.append(row)
             if use_step_budget:
@@ -777,7 +926,17 @@ def main() -> None:
         "cost); ignored when --steps is set",
     )
     p.add_argument("--evaluation-interval", type=int, default=64)
-    p.add_argument("--warmup-count", type=int, default=5)
+    p.add_argument(
+        "--warmup-count",
+        type=int,
+        default=5,
+        help="minimum warmup steps before measurement starts; rounded up to a whole "
+        "multiple of --evaluation-interval, since warm() batches steps into "
+        "--evaluation-interval-sized groups (matching the measured training loop's own "
+        "checkpoint-group structure, so the driver's first-use cost for that batched-"
+        "dispatch-with-timestamp-queries shape is paid here instead of during the first "
+        "measured checkpoint)",
+    )
     p.add_argument("--timing-repetitions", type=int, default=100)
     p.add_argument("--timing-workload", type=int, default=4096)
     p.add_argument(

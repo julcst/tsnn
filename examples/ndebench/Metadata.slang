@@ -9,10 +9,11 @@ import architectures.NSFRQS;
 import architectures.HDF;
 
 RWStructuredBuffer<uint> gMetadata;
+StructuredBuffer<uint2> gLayout;
 
 void metadata<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 {
-    gMetadata[0] = T.getParamCount();
+    gMetadata[0] = T.getParamCount(gLayout);
 }
 
 #define NDEBENCH_METADATA_KERNEL(ARCHITECTURE) \

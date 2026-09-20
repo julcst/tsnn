@@ -44,29 +44,37 @@ struct DFL : IArchitecture
     typealias YNet = MLP<kContextDim + kEncodedDim, kY, 3, kY>;
     typealias Activation = LeakyReLU;
 
-    static constexpr const XNet kXMLP = XNet(0u);
-    static constexpr const YNet kYMLP = YNet(kXMLP.end);
+    // Base indices into the host-supplied `Layout` buffer (see
+    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
+    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
+    // chained in declaration order, mirroring benchmark.py's own layout
+    // builder for this architecture.
+    static constexpr const uint kXBase = 0u;
+    static constexpr const uint kYBase = kXBase + 4u;
 
-    static uint getParamCount() {
+    static XNet makeXNet(no_diff Layout layout) { return XNet(layout, kXBase); }
+    static YNet makeYNet(no_diff Layout layout) { return YNet(layout, kYBase); }
+
+    static uint getParamCount(no_diff Layout layout) {
         // `end` is a byte offset in the fp16 parameter layout; both MLPs are
         // chained into one buffer, so the fine MLP's end covers both blocks.
-        return kYMLP.end / uint(sizeof(half));
+        return makeYNet(layout).end / uint(sizeof(half));
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
-        RWByteAddressBuffer params, RWByteAddressBuffer master, uint tid, uint threadCount)
+        RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        kXMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        kYMLP.initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeXNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        makeYNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
     }
 
     [Differentiable]
-    static float[kX] forwardX(MatrixBiasBuffer weights, Context ctx) {
-        return CoopVecToArray(kXMLP.forward<Activation>(weights, ctx));
+    static float[kX] forwardX(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
+        return CoopVecToArray(makeXNet(layout).forward<Activation>(weights, ctx));
     }
 
     [Differentiable]
-    static float[kY] forwardY(MatrixBiasBuffer weights, Context ctx, no_diff float x) {
+    static float[kY] forwardY(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float x) {
         // See DFN.forwardY: ComposeCoopVecPlus takes ctx as a CoopVec directly
         // and a no_diff half[] tail; the triangle-wave CoopVec is routed through
         // CoopVecToArray first (safe: x is no_diff data, not a learnable feature).
@@ -77,7 +85,7 @@ struct DFL : IArchitecture
             enc[i] = half(encFloats[i]);
 
         let input = ComposeCoopVecPlus<kContextDim, kEncodedDim>(ctx, enc);
-        let params = CoopVecToArray(kYMLP.forward<Activation>(weights, input));
+        let params = CoopVecToArray(makeYNet(layout).forward<Activation>(weights, input));
         return params;
     }
 
@@ -118,11 +126,11 @@ struct DFL : IArchitecture
     }
 
     [Differentiable]
-    static float evalLogPDF(MatrixBiasBuffer weights, Context ctx, no_diff float2 x) {
-        let histXLogits = forwardX(weights, ctx);
+    static float evalLogPDF(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float2 x) {
+        let histXLogits = forwardX(weights, layout, ctx);
         var logPDF = evalLogDensity1D<kX>(histXLogits, x.x);
 
-        let histYLogits = forwardY(weights, ctx, x.x);
+        let histYLogits = forwardY(weights, layout, ctx, x.x);
         logPDF += evalLogDensity1D<kY>(histYLogits, x.y);
 
         return logPDF;
@@ -196,12 +204,12 @@ struct DFL : IArchitecture
         return x0 + rem / max(v[M - 1u], 1e-20f);
     }
 
-    static float2 sample(MatrixBiasBuffer weights, Context ctx, inout PCG32 rand) {
-        let histXLogits = forwardX(weights, ctx);
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand) {
+        let histXLogits = forwardX(weights, layout, ctx);
         let vX = computeV<kX>(histXLogits);
         let x = sample1D<kX>(vX, rand.nextFloat());
 
-        let histYLogits = forwardY(weights, ctx, x);
+        let histYLogits = forwardY(weights, layout, ctx, x);
         let vY = computeV<kY>(histYLogits);
         let y = sample1D<kY>(vY, rand.nextFloat());
 
