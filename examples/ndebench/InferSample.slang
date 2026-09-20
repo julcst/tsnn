@@ -5,6 +5,12 @@ import TSNN.Utils.PCG32;
 import architectures.IArchitecture;
 import architectures.TMM;
 import architectures.HGGrid;
+import architectures.DFN;
+import architectures.DFL;
+import architectures.NSFLinear;
+import architectures.NSFQuadratic;
+import architectures.NSFRQS;
+import architectures.HDF;
 
 ByteAddressBuffer gParams;
 RWStructuredBuffer<float2> gSamples;
@@ -36,3 +42,9 @@ void inferSample<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 
 NDEBENCH_INFER_SAMPLE_KERNEL(TMM)
 NDEBENCH_INFER_SAMPLE_KERNEL(HGGrid)
+NDEBENCH_INFER_SAMPLE_KERNEL(DFN)
+NDEBENCH_INFER_SAMPLE_KERNEL(DFL)
+NDEBENCH_INFER_SAMPLE_KERNEL(NSFLinear)
+NDEBENCH_INFER_SAMPLE_KERNEL(NSFQuadratic)
+NDEBENCH_INFER_SAMPLE_KERNEL(NSFRQS)
+NDEBENCH_INFER_SAMPLE_KERNEL(HDF)

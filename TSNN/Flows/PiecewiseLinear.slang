@@ -130,12 +130,19 @@ FlowStep plInverse<let K : uint>(float y, float q[K], float tail)
 
 // ─── CoopVec-form overloads (unpack packed [q] internally) ────────────────────
 
+// Raw-conditioner-output clamp, matching TSNN.Flows.RQS's kRQSMaxRaw: a
+// runaway conditioner MLP can emit an unbounded (even +-inf) raw logit here,
+// same as it did for TSNN.Mixtures.Histogram (see FINDING.md's DF-N/NSF-
+// Quadratic writeup) -- clamping before any softmax math in plForward/
+// plInverse prevents inf/NaN from ever entering this bijection's decode.
+static const float kPLMaxRaw = 15.0f;
+
 [Differentiable]
 FlowStep plForward<let K : uint>(float x, CoopVec<half, K> cv, no_diff float tail)
 {
     let arr = CoopVecToArray(cv);
     float q[K];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) q[i] = arr[i];
+    [ForceUnroll] for (uint i = 0u; i < K; i++) q[i] = clamp(arr[i], -kPLMaxRaw, kPLMaxRaw);
     return plForward<K>(x, q, tail);
 }
 
@@ -143,6 +150,6 @@ FlowStep plInverse<let K : uint>(float y, CoopVec<half, K> cv, float tail)
 {
     let arr = CoopVecToArray(cv);
     float q[K];
-    [ForceUnroll] for (uint i = 0u; i < K; i++) q[i] = arr[i];
+    [ForceUnroll] for (uint i = 0u; i < K; i++) q[i] = clamp(arr[i], -kPLMaxRaw, kPLMaxRaw);
     return plInverse<K>(y, q, tail);
 }

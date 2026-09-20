@@ -12,6 +12,8 @@ import hashlib
 import importlib.metadata
 import json
 import platform
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,7 @@ ROOT = HERE.parent.parent
 
 # Architectures wired into the NDEBENCH_*_KERNEL macros (one struct per
 # architectures/<name>.slang, implementing IArchitecture).
-ARCHITECTURES = ("TMM", "HGGrid")
+ARCHITECTURES = ("TMM", "HGGrid", "DFN", "DFL", "NSFLinear", "NSFQuadratic", "NSFRQS", "HDF")
 
 # Module and entry-point prefix each REGISTRY kind's kernel lives under,
 # mirroring the *_KERNEL macro invocations in the corresponding .slang file
@@ -185,6 +187,7 @@ class Runner:
     width: int
     height: int
     batch_size: int
+    sample_out_count: int
 
     def reset(self, arch: str) -> None:
         enc = self.device.create_command_encoder()
@@ -226,7 +229,20 @@ class Runner:
                     "gWidth": self.width,
                     "gHeight": self.height,
                     "gCount": count,
-                    "gStreamOffset": stream_offset,
+                    # gStreamOffset is a uint32 cbuffer field
+                    # (ImageSample.slang); callers compute it as
+                    # step * batch_size, which the equal-GPU-time training
+                    # budget can now run far enough (hundreds of thousands of
+                    # steps for a cheap-per-step architecture) to overflow
+                    # 2**32 -- slangpy's cursor write then raises
+                    # `std::bad_cast` instead of silently truncating. Wrap
+                    # explicitly: it is only a PCG32 stream-decorrelation
+                    # offset (PCG32(seed, gStreamOffset + tid.x) in
+                    # ImageSample.slang), so wrapping after ~4 billion
+                    # samples just means two steps very far apart in an
+                    # already-long run reuse the same stream slice --
+                    # inconsequential next to the alternative of crashing.
+                    "gStreamOffset": stream_offset & 0xFFFFFFFF,
                     "gSeed": seed,
                 },
             },
@@ -365,6 +381,7 @@ def make_runner(
         width,
         height,
         batch_size,
+        sample_out_count,
     )
 
 
@@ -445,8 +462,77 @@ def timestamped_inference(
     }
 
 
+def sample_importance_ratio_variance(
+    r: Runner, arch: str, masses: np.ndarray, width: int, height: int, seed: int, count: int
+) -> tuple[float, float, float]:
+    """Variance (and mean) of the importance-sampling ratio p_ref(x)/p_model(x)
+    for x drawn from the trained model's own sample() -- the standard
+    diagnostic for how well a learned sampling distribution matches its
+    target: a model that is locally under-confident where the target has
+    mass produces a long-tailed ratio and a large variance, even if its NLL
+    looks reasonable on average.
+
+    p_ref is the same piecewise-constant-per-texel density
+    (masses*width*height) reference_logpdf uses, looked up by nearest texel
+    at each continuous sample coordinate.
+
+    A sample the model itself assigns exactly zero density (model_logpdf ==
+    -inf) makes the ratio a genuine +inf, not a numerical artifact of this
+    function -- observed in practice for a small fraction (~0.2-0.3%) of
+    TMM's own samples (TruncatedGMM.sample()'s inverse-normal-CDF step,
+    unrelated to this session's DFN/DFL work; not fixed here, flagged in
+    FINDING.md). One +inf silently NaNs np.var's mean-of-squares, which would
+    make the WHOLE architecture's reported variance meaningless instead of
+    just the offending samples'. Mirrors plot.py's own saturated-pixel-
+    fraction precedent: exclude non-finite ratios from the statistic and
+    report what fraction were excluded, rather than let a handful of
+    degenerate draws erase the signal from the rest.
+    """
+    n = min(count, r.sample_out_count)
+    r.kernels[REGISTRY[arch]["sample"]].dispatch(
+        thread_count=[n, 1, 1],
+        vars={"gParams": r.params, "gSamples": r.sample_out, "SampleCB": {"gSeed": seed}},
+    )
+    r.device.wait()
+    r.kernels[REGISTRY[arch]["eval"]].dispatch(
+        thread_count=[n, 1, 1],
+        vars={"gParams": r.params, "gSamples": r.sample_out, "gLogPDFs": r.eval_out},
+    )
+    r.device.wait()
+    xy = np.frombuffer(r.sample_out.to_numpy(), dtype=np.float32).reshape(-1, 2)[:n]
+    model_logpdf = np.frombuffer(r.eval_out.to_numpy(), dtype=np.float32).copy()[:n]
+    # Clamp to [0, 1) BEFORE scaling by width/height and casting to int: a
+    # handful of samples can be a degenerate +-inf/NaN (see this function's
+    # docstring), and scaling an inf coordinate first, then casting that
+    # still-inf-or-overflowing float to int64, is undefined behavior (numpy
+    # warns "invalid value encountered in cast"). Clamping the coordinate
+    # itself first keeps every cast in-range.
+    unit = np.nextafter(1.0, 0.0, dtype=np.float32)
+    xy_clamped = np.nan_to_num(np.clip(xy, 0.0, unit), nan=0.0, posinf=unit, neginf=0.0)
+    cols = np.clip((xy_clamped[:, 0] * width).astype(np.int64), 0, width - 1)
+    rows = np.clip((xy_clamped[:, 1] * height).astype(np.int64), 0, height - 1)
+    ref_density = masses[rows, cols] * (width * height)
+    model_density = np.exp(model_logpdf.astype(np.float64))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(ref_density > 0, ref_density / model_density, 0.0)
+    finite = np.isfinite(ratio)
+    degenerate_fraction = 1.0 - float(np.count_nonzero(finite)) / n
+    if not np.any(finite):
+        return float("nan"), float("nan"), degenerate_fraction
+    return (
+        float(np.var(ratio[finite], dtype=np.float64)),
+        float(np.mean(ratio[finite], dtype=np.float64)),
+        degenerate_fraction,
+    )
+
+
 def run_architecture(
-    r: Runner, arch: str, masses: np.ndarray, args: argparse.Namespace, output: Path
+    r: Runner,
+    arch: str,
+    masses: np.ndarray,
+    args: argparse.Namespace,
+    output: Path,
+    reference_entropy: float,
 ) -> dict:
     r.warm(
         arch,
@@ -459,6 +545,14 @@ def run_architecture(
     initial, grid_time = r.eval_grid(arch)
     h, w = masses.shape
 
+    # Started here, after warmup and this architecture's initial grid eval --
+    # the clock every checkpoint's "wall_seconds" (below) and the equal-time
+    # training budget (further down) are both measured against. This is the
+    # ONLY seconds figure that actually reflects the equal-time budget: see
+    # checkpoint()'s docstring-style comment for why
+    # "cumulative_training_gpu_seconds" is a different, smaller number.
+    wall_started = time.perf_counter()
+
     def checkpoint(step: int, consumed: int, timing: float, eval_seconds: float) -> dict:
         logpdf, seconds = r.eval_grid(arch)
         nll = -float(
@@ -468,8 +562,18 @@ def run_architecture(
             "step": step,
             "samples_consumed": consumed,
             "nll": nll,
+            # Sum of pure GPU-kernel dispatch time for the train-loop kernels
+            # only (generate+clear+forward+optimize), measured via GPU
+            # timestamp queries. This IS the quantity --seconds-per-method
+            # budgets equally across architectures (see the training-loop
+            # comment below for why GPU time rather than wall-clock).
             "cumulative_training_gpu_seconds": timing,
             "grid_evaluation_seconds": seconds + eval_seconds,
+            # Wall-clock time, purely informational: how much real time this
+            # checkpoint's slice of training + evaluation actually took,
+            # Python/driver overhead and sync waits included. Not what the
+            # equal-time budget targets -- see the training-loop comment.
+            "wall_seconds": time.perf_counter() - wall_started,
         }, logpdf
 
     rows, final = [], initial
@@ -483,15 +587,52 @@ def run_architecture(
             "nll": initial_nll,
             "cumulative_training_gpu_seconds": 0.0,
             "grid_evaluation_seconds": grid_time,
+            "wall_seconds": 0.0,
         }
     )
     total_generate = total_train = total_clear = total_forward = total_opt = 0.0
     step = 0
     total_consumed = 0
-    total_steps = args.steps
-    with tqdm(total=total_steps, desc=f"{arch} train", unit="step") as pbar:
-        while step < total_steps:
-            group_size = min(args.evaluation_interval, total_steps - step)
+
+    # Equal-time mode (the default: args.steps left unset) bounds each
+    # architecture's training loop by GPU-measured training seconds
+    # (total_train, the same GPU-timestamp sum stored per checkpoint as
+    # "cumulative_training_gpu_seconds") instead of a fixed step count, so
+    # every method gets the same GPU compute budget regardless of its
+    # per-step cost -- fairer for comparing architectures whose per-step
+    # time varies a lot (see the timing table: NSFRQS/HGGrid run ~4-5x the
+    # per-update cost of TMM/DFL). Deliberately GPU time, not wall-clock:
+    # wall-clock also counts Python/driver dispatch overhead and CPU<->GPU
+    # sync waits, which are a per-call constant this benchmark's small
+    # per-step batches make disproportionately large -- not representative
+    # of a production inference/training loop's actual GPU cost, and it
+    # would unfairly penalize an architecture just for issuing more, smaller
+    # dispatches. total_train excludes checkpoint eval_grid() calls (a
+    # separate "grid_evaluation_seconds" figure) and, since it only starts
+    # accumulating once the training loop below begins -- after
+    # make_runner's one-time shared kernel compilation and after this
+    # architecture's own warmup -- it never counts compile time either.
+    # Checked at the top of the loop using the previous iteration's
+    # accumulated total, since a group's own GPU time is only known after it
+    # runs. Only `--smoke`'s forced `args.steps = 2` (and an explicit
+    # `--steps` override) still use the old fixed-step-count path.
+    use_step_budget = args.steps is not None
+    total_steps = args.steps if use_step_budget else None
+    pbar_kwargs = (
+        {"total": total_steps, "unit": "step"}
+        if use_step_budget
+        else {"total": args.seconds_per_method, "unit": "gpu-s"}
+    )
+    with tqdm(desc=f"{arch} train", **pbar_kwargs) as pbar:
+        while True:
+            if use_step_budget:
+                if step >= total_steps:
+                    break
+                group_size = min(args.evaluation_interval, total_steps - step)
+            else:
+                if total_train >= args.seconds_per_method:
+                    break
+                group_size = args.evaluation_interval
             q = r.device.create_query_pool(spy.QueryType.timestamp, group_size * 5)
             enc = r.device.create_command_encoder()
             for i in range(group_size):
@@ -538,7 +679,11 @@ def run_architecture(
             total_train += float(np.sum(stamps[:, 4] - stamps[:, 0]))
             row, final = checkpoint(step, total_consumed, total_train, 0.0)
             rows.append(row)
-            pbar.update(group_size)
+            if use_step_budget:
+                pbar.update(group_size)
+            else:
+                elapsed = min(args.seconds_per_method, total_train)
+                pbar.update(max(0.0, elapsed - pbar.n))
             pbar.set_postfix(nll=f"{row['nll']:.4f}")
     final_image = final.reshape(h, w)
     np.save(output / f"{arch}_final_logpdf.npy", final_image)
@@ -547,12 +692,33 @@ def run_architecture(
         np.uint8
     )
     Image.fromarray(display, mode="L").save(output / f"{arch}_final_logpdf.png")
+
+    final_nll = rows[-1]["nll"]
+    ratio_variance, ratio_mean, ratio_degenerate_fraction = sample_importance_ratio_variance(
+        r, arch, masses, w, h, args.seed, args.variance_sample_count
+    )
     return {
         "metadata": {
             "parameter_elements_fp16": r.elements_by_arch[arch],
             "padded_parameter_elements": r.padded_by_arch[arch],
         },
         "checkpoints": rows,
+        "final_metrics": {
+            # KL(target || model) = H(target, model) - H(target); final_nll
+            # IS H(target, model) (the cross-entropy checkpoint() already
+            # computes), so this needs no extra GPU evaluation.
+            "kl_divergence": final_nll - reference_entropy,
+            # Var[p_ref(x)/p_model(x)] for x ~ model.sample() -- the standard
+            # importance-sampling diagnostic: large even when NLL looks fine
+            # if the model is locally under-confident somewhere the target
+            # has mass. See sample_importance_ratio_variance()'s docstring.
+            "sample_importance_ratio_variance": ratio_variance,
+            "sample_importance_ratio_mean": ratio_mean,
+            # Fraction of the variance-estimate samples the model itself
+            # assigned exactly zero density (ratio == +inf), excluded from
+            # the two stats above rather than left in to NaN them.
+            "sample_importance_ratio_degenerate_fraction": ratio_degenerate_fraction,
+        },
         "timing": {
             "mean_training_ms_per_update": total_train / step * 1000,
             "sample_generation_seconds": total_generate,
@@ -588,14 +754,47 @@ def main() -> None:
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--loss-scale", type=float, default=128.0)
     p.add_argument("--gradient-clip", type=float, default=1.0)
-    p.add_argument("--steps", type=int, default=8192)
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="fixed step count per architecture; overrides --seconds-per-method when set",
+    )
+    p.add_argument(
+        "--seconds-per-method",
+        type=float,
+        default=5.0,
+        # Default deliberately much smaller than a wall-clock budget would be:
+        # GPU-measured seconds only count actual kernel time, so reaching even
+        # a modest target can take much longer in real wall-clock time for a
+        # cheap-per-step architecture -- e.g. an earlier 60-wall-second run's
+        # GPU-measured total ranged from ~16% (HGGrid) down to under 1% (DFL)
+        # of that wall time, so a 60 GPU-second target could take the better
+        # part of an hour of real time for the fastest architectures.
+        help="equal-time training budget per architecture, in GPU-measured seconds "
+        "(cumulative_training_gpu_seconds, not wall-clock -- production-representative GPU "
+        "compute, excluding Python/driver overhead and the one-time shared kernel-compile "
+        "cost); ignored when --steps is set",
+    )
     p.add_argument("--evaluation-interval", type=int, default=64)
     p.add_argument("--warmup-count", type=int, default=5)
     p.add_argument("--timing-repetitions", type=int, default=100)
     p.add_argument("--timing-workload", type=int, default=4096)
+    p.add_argument(
+        "--variance-sample-count",
+        type=int,
+        default=65536,
+        help="samples drawn from each trained model to estimate the final importance-ratio "
+        "variance (clamped to the sample buffer's own capacity)",
+    )
     p.add_argument("--output-directory", type=Path, default=HERE / "output")
     p.add_argument("--validate", action="store_true")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="skip automatically running plot.py on the freshly written results",
+    )
     args = p.parse_args()
     validate() if args.validate else None
     if args.validate and not args.smoke:
@@ -605,20 +804,23 @@ def main() -> None:
     unknown = sorted(set(names) - REGISTRY.keys())
     if unknown:
         p.error(f"unknown architectures {unknown}; supported: {', '.join(REGISTRY)}")
-    if (
-        min(
-            args.batch_size,
-            args.steps,
-            args.evaluation_interval,
-            args.timing_repetitions,
-            args.timing_workload,
-        )
-        < 1
-    ):
+    counts = [
+        args.batch_size,
+        args.evaluation_interval,
+        args.timing_repetitions,
+        args.timing_workload,
+        args.variance_sample_count,
+    ]
+    if args.steps is not None:
+        counts.append(args.steps)
+    if min(counts) < 1:
         p.error("counts must be positive")
+    if args.seconds_per_method <= 0:
+        p.error("--seconds-per-method must be positive")
     if args.smoke:
         args.batch_size, args.evaluation_interval = 16, 1
         args.timing_repetitions, args.timing_workload = 2, 16
+        args.variance_sample_count = 16
         args.steps = 2
     masses, width, height = load_image(args.image)
     if args.smoke:
@@ -632,6 +834,12 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     with np.errstate(divide="ignore"):
         reference_logpdf = np.where(masses > 0, np.log(masses * width * height), -np.inf)
+    # H(target): entropy of the reference distribution, needed to turn each
+    # architecture's cross-entropy (final NLL) into KL(target || model)
+    # without re-evaluating anything on the GPU (see run_architecture).
+    reference_entropy = -float(
+        np.sum(masses[masses > 0] * reference_logpdf[masses > 0], dtype=np.float64)
+    )
     np.save(output / "reference_masses.npy", masses)
     np.save(output / "reference_logpdf.npy", reference_logpdf)
     r = make_runner(
@@ -649,12 +857,18 @@ def main() -> None:
         "device": {"adapter": r.device.info.adapter_name, "backend": r.device.info.api_name},
         "versions": package_versions(),
         "cdf_precompute_seconds": cdf_precompute_seconds,
+        "reference_entropy": reference_entropy,
         "architectures": {},
     }
     for name in names:
-        report["architectures"][name] = run_architecture(r, name, masses, args, output)
+        report["architectures"][name] = run_architecture(
+            r, name, masses, args, output, reference_entropy
+        )
     (output / "results.json").write_text(json.dumps(report, indent=2, default=str) + "\n")
     print(f"wrote {output / 'results.json'}")
+
+    if not args.no_plot:
+        subprocess.run([sys.executable, str(HERE / "plot.py"), str(output)], check=True)
 
 
 if __name__ == "__main__":

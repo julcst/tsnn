@@ -6,6 +6,12 @@ import TSNN.Encodings.FeatureBuffer;
 import architectures.IArchitecture;
 import architectures.TMM;
 import architectures.HGGrid;
+import architectures.DFN;
+import architectures.DFL;
+import architectures.NSFLinear;
+import architectures.NSFQuadratic;
+import architectures.NSFRQS;
+import architectures.HDF;
 
 /// float16 gradients written by train, read-only
 StructuredBuffer<half4> gParamGrads;
@@ -75,6 +81,12 @@ void init<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
 
 NDEBENCH_RESET_KERNEL(TMM)
 NDEBENCH_RESET_KERNEL(HGGrid)
+NDEBENCH_RESET_KERNEL(DFN)
+NDEBENCH_RESET_KERNEL(DFL)
+NDEBENCH_RESET_KERNEL(NSFLinear)
+NDEBENCH_RESET_KERNEL(NSFQuadratic)
+NDEBENCH_RESET_KERNEL(NSFRQS)
+NDEBENCH_RESET_KERNEL(HDF)
 
 [numthreads(256, 1, 1)]
 void optimize(uint3 tid: SV_DispatchThreadID)

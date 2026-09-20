@@ -6,6 +6,26 @@ uint2 bin2grid(uint bin, uint dim) {
     return uint2(bin / dim, bin % dim);
 }
 
+// Clamp raw (pre-softmax) logits to a bounded range before any softmax math,
+// mirroring TSNN.Flows.RQS's kRQSMaxRaw clamp on its own raw conditioner
+// output -- Histogram had no analog. This is a real, observed failure mode,
+// not a hypothetical: a runaway conditioner MLP can (and, on the DF-N
+// benchmark architecture, does) emit a literal +-inf logit. Once any logit
+// is +-inf, `maxLog - logWeights[i]` produces inf-inf = NaN, and NaN then
+// silently reduces to a finite (but meaningless) value through every
+// `max(x, 1e-30f)`-style guard in this codebase, confirmed empirically on
+// this Slang/Vulkan backend's `max`: `max(NaN, y) == y` whenever NaN is the
+// FIRST argument (the second argument wins), so `log(max(p, 1e-30f))`
+// quietly becomes log(1e-30f) = -69.08 instead of NaN or a crash. That let a
+// genuinely diverged model keep training and reporting a plausible-looking
+// but bogus NLL for thousands of further steps instead of surfacing the real
+// bug (see FINDING.md). Clamping the logits up front prevents inf/NaN from
+// ever entering this struct's math in the first place -- simpler and more
+// robust than flooring the output probability after the fact (the previous
+// version of this fix), and it stays entirely in log space: no extra exp/
+// log/division round trip.
+static const float kHistMaxLogit = 15.0f; // matches TSNN.Flows.RQS's kRQSMaxRaw
+
 /**
  * A histogram is a discrete probability distribution over a fixed number of bins.
  * The bins are indexed from 0 to N-1, where N is the number of bins.
@@ -22,21 +42,28 @@ struct Histogram<uint N> {
     [Differentiable]
     float eval<T : IFloat>(T logWeights[N], uint bin)
     {
+        float w[N];
+        [ForceUnroll]
+        for (uint i = 0; i < N; ++i)
+        {
+            w[i] = clamp(logWeights[i].toFloat(), -kHistMaxLogit, kHistMaxLogit);
+        }
+
         float maxLog = -1.0#INF;
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
         {
-            maxLog = max(maxLog, logWeights[i].toFloat());
+            maxLog = max(maxLog, w[i]);
         }
 
         float sumExp = 0.0;
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
         {
-            sumExp += exp(logWeights[i].toFloat() - maxLog);
+            sumExp += exp(w[i] - maxLog);
         }
 
-        return logWeights[bin].toFloat() - maxLog - log(sumExp);
+        return w[bin] - maxLog - log(sumExp);
     }
 
     /**
@@ -47,11 +74,18 @@ struct Histogram<uint N> {
      */
     uint sample<T : IFloat>(T logWeights[N], float u)
     {
+        float w[N];
+        [ForceUnroll]
+        for (uint i = 0; i < N; ++i)
+        {
+            w[i] = clamp(logWeights[i].toFloat(), -kHistMaxLogit, kHistMaxLogit);
+        }
+
         float maxLog = -1.0#INF;
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
         {
-            maxLog = max(maxLog, logWeights[i].toFloat());
+            maxLog = max(maxLog, w[i]);
         }
 
         float output[N];
@@ -59,7 +93,7 @@ struct Histogram<uint N> {
         [ForceUnroll]
         for (uint i = 0; i < N; ++i)
         {
-            output[i] = exp(logWeights[i].toFloat() - maxLog);
+            output[i] = exp(w[i] - maxLog);
             sumExp += output[i];
         }
 

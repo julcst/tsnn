@@ -178,13 +178,23 @@ FlowStep pqInverse<let K : uint>(float y, float W[K], float V[K + 1u], float tai
 
 // ─── CoopVec-form overloads (unpack packed [W|V] internally) ──────────────────
 
+// Raw-conditioner-output clamp, matching TSNN.Flows.RQS's kRQSMaxRaw: a
+// runaway conditioner MLP can emit an unbounded (even +-inf) raw logit here,
+// same as it did for TSNN.Mixtures.Histogram (see FINDING.md's DF-N/NSF-
+// Quadratic writeup) -- clamping before any softmax/normalisation math in
+// pqForward/pqInverse prevents inf/NaN from ever entering this bijection's
+// decode (this file's own vertex normalisation divides by a sum of exp(V),
+// which is more numerically fragile than PiecewiseLinear's plain softmax and
+// is exactly what was observed to blow up in practice).
+static const float kPQMaxRaw = 15.0f;
+
 [Differentiable]
 FlowStep pqForward<let K : uint>(float x, CoopVec<half, 2u * K + 1u> cv, no_diff float tail)
 {
     let arr = CoopVecToArray(cv);
     float W[K], V[K + 1u];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) W[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K + 1u; i++) V[i] = arr[K + i];
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) W[i] = clamp(arr[i], -kPQMaxRaw, kPQMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K + 1u; i++) V[i] = clamp(arr[K + i], -kPQMaxRaw, kPQMaxRaw);
     return pqForward<K>(x, W, V, tail);
 }
 
@@ -192,7 +202,7 @@ FlowStep pqInverse<let K : uint>(float y, CoopVec<half, 2u * K + 1u> cv, float t
 {
     let arr = CoopVecToArray(cv);
     float W[K], V[K + 1u];
-    [ForceUnroll] for (uint i = 0u; i < K;      i++) W[i] = arr[i];
-    [ForceUnroll] for (uint i = 0u; i < K + 1u; i++) V[i] = arr[K + i];
+    [ForceUnroll] for (uint i = 0u; i < K;      i++) W[i] = clamp(arr[i], -kPQMaxRaw, kPQMaxRaw);
+    [ForceUnroll] for (uint i = 0u; i < K + 1u; i++) V[i] = clamp(arr[K + i], -kPQMaxRaw, kPQMaxRaw);
     return pqInverse<K>(y, W, V, tail);
 }
