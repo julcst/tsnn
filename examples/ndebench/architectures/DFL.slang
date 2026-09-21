@@ -45,32 +45,28 @@ struct DFL : IArchitecture
     typealias Activation = LeakyReLU;
 
     // Base indices into the host-supplied `Layout` buffer (see
-    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
-    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
-    // chained in declaration order, mirroring benchmark.py's own layout
-    // builder for this architecture.
+    // IArchitecture.slang and TSNN.Utils.MLP's static from-layout methods'
+    // doc comment): each MLP contributes DEPTH+1 = 4 entries, chained in
+    // declaration order, mirroring benchmark.py's own layout builder for
+    // this architecture.
     static constexpr const uint kXBase = 0u;
     static constexpr const uint kYBase = kXBase + 4u;
 
-    static XNet makeXNet(no_diff Layout layout) { return XNet(layout, kXBase); }
-    static YNet makeYNet(no_diff Layout layout) { return YNet(layout, kYBase); }
-
     static uint getParamCount(no_diff Layout layout) {
-        // `end` is a byte offset in the fp16 parameter layout; both MLPs are
-        // chained into one buffer, so the fine MLP's end covers both blocks.
-        return makeYNet(layout).end / uint(sizeof(half));
+        // YNet's end covers both blocks: both MLPs are chained into one buffer.
+        return YNet.paramCount(layout, kYBase);
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
         RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        makeXNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        makeYNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        XNet.initParams<TMirror, TMaster>(params, master, layout, kXBase, tid, threadCount);
+        YNet.initParams<TMirror, TMaster>(params, master, layout, kYBase, tid, threadCount);
     }
 
     [Differentiable]
     static float[kX] forwardX(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(makeXNet(layout).forward<Activation>(weights, ctx));
+        return CoopVecToArray(XNet.forward<Activation>(weights, layout, kXBase, ctx));
     }
 
     [Differentiable]
@@ -85,7 +81,7 @@ struct DFL : IArchitecture
             enc[i] = half(encFloats[i]);
 
         let input = ComposeCoopVecPlus<kContextDim, kEncodedDim>(ctx, enc);
-        let params = CoopVecToArray(makeYNet(layout).forward<Activation>(weights, input));
+        let params = CoopVecToArray(YNet.forward<Activation>(weights, layout, kYBase, input));
         return params;
     }
 

@@ -28,27 +28,23 @@ struct HGGrid : IArchitecture
     static constexpr const GMM kGMM = GMM();
 
     // Base indices into the host-supplied `Layout` buffer (see
-    // IArchitecture.slang and TSNN.Utils.MLP's `__init(Layout, uint)`
-    // overload's doc comment): each MLP contributes DEPTH+1 = 4 entries,
-    // chained in declaration order, mirroring benchmark.py's own layout
-    // builder for this architecture.
+    // IArchitecture.slang and TSNN.Utils.MLP's static from-layout methods'
+    // doc comment): each MLP contributes DEPTH+1 = 4 entries, chained in
+    // declaration order, mirroring benchmark.py's own layout builder for
+    // this architecture.
     static constexpr const uint kCoarseBase = 0u;
     static constexpr const uint kFineBase = kCoarseBase + 4u;
 
-    static CoarseNet makeCoarseNet(no_diff Layout layout) { return CoarseNet(layout, kCoarseBase); }
-    static FineNet makeFineNet(no_diff Layout layout) { return FineNet(layout, kFineBase); }
-
     static uint getParamCount(no_diff Layout layout) {
-        // `end` is a byte offset in the fp16 parameter layout; both MLPs are
-        // chained into one buffer, so the fine MLP's end covers both blocks.
-        return makeFineNet(layout).end / uint(sizeof(half));
+        // FineNet's end covers both blocks: both MLPs are chained into one buffer.
+        return FineNet.paramCount(layout, kFineBase);
     }
 
     static void initParams<TMirror : IFloat, TMaster : IFloat>(
         RWByteAddressBuffer params, RWByteAddressBuffer master, no_diff Layout layout, uint tid, uint threadCount)
     {
-        makeCoarseNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
-        makeFineNet(layout).initParams<TMirror, TMaster>(params, master, tid, threadCount);
+        CoarseNet.initParams<TMirror, TMaster>(params, master, layout, kCoarseBase, tid, threadCount);
+        FineNet.initParams<TMirror, TMaster>(params, master, layout, kFineBase, tid, threadCount);
     }
 
     static half[kEncodedDim] encodeCell(no_diff uint2 cell) {
@@ -67,13 +63,13 @@ struct HGGrid : IArchitecture
 
     [Differentiable]
     static float[kNumCells] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(makeCoarseNet(layout).forward<Activation>(weights, ctx));
+        return CoopVecToArray(CoarseNet.forward<Activation>(weights, layout, kCoarseBase, ctx));
     }
 
     [Differentiable]
     static float[K * 5] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 cell) {
         let input = ComposeCoopVecPlus(ctx, encodeCell(cell));
-        let params = CoopVecToArray(makeFineNet(layout).forward<Activation>(weights, input));
+        let params = CoopVecToArray(FineNet.forward<Activation>(weights, layout, kFineBase, input));
         // Clip logSigma?
         return params;
     }

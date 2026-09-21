@@ -125,14 +125,19 @@ struct MLP<
         for (uint l = 0u; l < DEPTH + 1u; ++l)
         {
             let shape = layerShape(l);
-            let inSize = shape.x, outSize = shape.y;
+            let inSize = shape.x;
+            let outSize = shape.y;
             let wStart = layout[base + l].x;
             let bStart = layout[base + l].y;
 
             if (byteOff >= bStart && byteOff < bStart + uint(sizeof(half)) * outSize)
                 return 0.0f; // bias
-            if (byteOff < wStart || byteOff >= wStart + uint(sizeof(half)) * inSize * outSize)
-                continue;    // not this layer's weights → keep scanning
+            if (byteOff < wStart || byteOff >= bStart)
+                continue;    // not this layer's weights → keep scanning. Upper bound is
+                             // bStart (this layer's own host-computed bias offset), not
+                             // wStart + inSize*outSize*sizeof(half): LAYOUT's real
+                             // per-layer weight region can be larger than the naive
+                             // element count (see this struct's own top comment).
 
             if (zeroLastLayer && l == DEPTH)
                 return 0.0f;

@@ -8,8 +8,10 @@ typealias Context = CoopVec<half, 1>;
 // architecture owns, packed back-to-back in MLP-declaration order (each MLP
 // contributing DEPTH+1 entries). Computed host-side via
 // Device.get_coop_vec_matrix_size for TrainingOptimal weight matrices --
-// see TSNN.Utils.MLP's `__init(StructuredBuffer<uint2>, uint)` overload's
-// doc comment for why this can't be a Slang-side compile-time constant.
+// see TSNN.Utils.MLP's own doc comment for why this can't be a Slang-side
+// compile-time constant. Every MLP<> in this codebase is purely static (no
+// instance/constructor at all) precisely so it never tempts anyone into
+// computing this itself.
 typealias Layout = StructuredBuffer<uint2>;
 
 /// Defines an NDE model
