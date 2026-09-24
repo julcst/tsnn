@@ -10,11 +10,14 @@ import TSNN.Mixtures.Histogram;
 import TSNN.Encodings.OneHot;
 import TSNN.Encodings.Compose;
 
-/// DFN: mlp -> histogram -> sample bin -> encode bin -> mlp -> histogram -> sample bin -> encode bin
-struct DFN : IArchitecture
+/// DFN<K>: mlp -> histogram -> sample bin -> encode bin -> mlp -> histogram -> sample bin -> encode bin.
+/// Generic over per-axis bin count K (FINDING.md's DF-vs-NSF speed investigation: DF's
+/// Histogram<K>::eval/sample fully unroll 4 O(K) passes, autodiff'd every training step,
+/// so K is directly comparable to NSFLinear's kNumBins=16 -- DFN16/DFL16 below match it).
+struct DFNImpl<let K : uint> : IArchitecture
 {
-    static constexpr const uint kX = 32; // x resolution
-    static constexpr const uint kY = 32; // y resolution
+    static constexpr const uint kX = K; // x resolution
+    static constexpr const uint kY = K; // y resolution
     static constexpr const uint kEncodedDim = 12; // TriangleWave encoding
     static constexpr const uint kContextDim = 1u; // must match IArchitecture.Context's CoopVec width
 
@@ -106,3 +109,8 @@ struct DFN : IArchitecture
         return float2(x, y);
     }
 }
+
+typealias DFN = DFNImpl<32u>;
+// Bin-matched to NSFLinear's kNumBins=16, to isolate "explicit histogram vs. coupling-flow
+// spline" from "resolution" when comparing DFN's training cost against NSF-L's.
+typealias DFN16 = DFNImpl<16u>;

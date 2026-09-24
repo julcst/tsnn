@@ -20,7 +20,10 @@ import TSNN.Encodings.Compose;
 /// treatment. (The paper wraps ε1/φ periodically since it is a spherical azimuth;
 /// this benchmark has no spherical semantics, so both axes use the same clamped
 /// treatment for simplicity.)
-struct DFL : IArchitecture
+///
+/// Generic over per-axis bin count K, same rationale as DFN's own DFNImpl<K>: K is
+/// directly comparable to NSFLinear's kNumBins=16 (DFL16 below matches it).
+struct DFLImpl<let K : uint> : IArchitecture
 {
     // Raw-conditioner-output clamp, matching TSNN.Mixtures.Histogram's
     // kHistMaxLogit / TSNN.Flows.{PiecewiseLinear,PiecewiseQuadratic,RQS}'s
@@ -35,8 +38,8 @@ struct DFL : IArchitecture
     // gap the same way it was closed everywhere else.
     static const float kDFLMaxRaw = 15.0f;
 
-    static constexpr const uint kX = 32; // x resolution
-    static constexpr const uint kY = 32; // y resolution
+    static constexpr const uint kX = K; // x resolution
+    static constexpr const uint kY = K; // y resolution
     static constexpr const uint kEncodedDim = 12; // TriangleWave encoding
     static constexpr const uint kContextDim = 1u; // must match IArchitecture.Context's CoopVec width
 
@@ -212,3 +215,7 @@ struct DFL : IArchitecture
         return float2(x, y);
     }
 }
+
+typealias DFL = DFLImpl<32u>;
+// Bin-matched to NSFLinear's kNumBins=16 -- see DFN16's own comment in DFN.slang.
+typealias DFL16 = DFLImpl<16u>;

@@ -301,7 +301,14 @@ float erfinv(float x)
 float normalCDFInverse(float p, float mean, float logSigma)
 {
     float k = exp(logSigma) * sqrt(2.0f);
-    return mean + k * erfinv(2.0f * p - 1.0f);
+    // Clamp p away from {0,1}: erfinv's `log2(1 - x^2)` blows up to +inf (x
+    // exactly +-1) or takes a negative argument (NaN, x past +-1 from float32
+    // rounding) once `2p-1` reaches the boundary -- the previously-documented
+    // "TMM sample() occasionally returns inf/out-of-[0,1]" issue (see
+    // FINDING.md). 1e-6 keeps 2p-1 comfortably inside (-1,1) without
+    // perceptibly biasing the sampled quantile.
+    let pc = clamp(p, 1.0e-6f, 1.0f - 1.0e-6f);
+    return mean + k * erfinv(2.0f * pc - 1.0f);
 }
 
 // Stable log P(0 <= X <= 1) for X ~ N(mean, sigma^2), sigma = exp(logSigma).

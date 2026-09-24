@@ -12,6 +12,16 @@ struct TruncatedGMM<uint N>
     static const uint STRIDE = 1 + 2 * D; // weight + mean + variance for each component
     typealias Output = vector<float, D>;
 
+    // logSigma is an unconstrained MLP output; clamping keeps sigma =
+    // exp(logSigma) in [exp(-6), exp(6)] ~= [0.0025, 403] -- generous for a
+    // sub-cell distribution over [0,1]^2, but keeps z = (x-mean)/sigma well
+    // away from the float32-overflow regime an unconstrained head eventually
+    // drifts into (logTruncMass/logTruncGaussianPDF's z*z and erfcxPositive's
+    // fitted input range both degrade to inf/NaN there). Fixes this file's own
+    // former "TODO: test logSigma floor" -- see FINDING.md's TruncatedGMM
+    // logSigma-floor entry for the training divergence this was causing.
+    static const float kLogSigmaMax = 6.0f;
+
     /**
     * Evaluates the log-probability density function (PDF) of the truncated GMM at a given sample point.
     * @param input An array containing the weights, means, and sigmas
@@ -31,8 +41,9 @@ struct TruncatedGMM<uint N>
             let offset = i * STRIDE;
             let logWeight = input[offset + 0].toFloat(); // normalized weight
             let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat()); // uncontrained mean
-            let logSigma = Output(input[offset + 3].toFloat(), input[offset + 4].toFloat()); // positive sigma
-            // TODO: test logSigma floor
+            let logSigma = Output(
+                clamp(input[offset + 3].toFloat(), -kLogSigmaMax, kLogSigmaMax),
+                clamp(input[offset + 4].toFloat(), -kLogSigmaMax, kLogSigmaMax));
 
             logits[i] = logWeight + logTruncGaussianPDF(x, mean, logSigma);
             logWeights[i] = logWeight;
@@ -54,7 +65,9 @@ struct TruncatedGMM<uint N>
         // Sample from the selected Gaussian component
         let offset = bin * STRIDE;
         let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat());
-        let logSigma = Output(input[offset + 3].toFloat(), input[offset + 4].toFloat());
+        let logSigma = Output(
+            clamp(input[offset + 3].toFloat(), -kLogSigmaMax, kLogSigmaMax),
+            clamp(input[offset + 4].toFloat(), -kLogSigmaMax, kLogSigmaMax));
 
         // Sample from the truncated Gaussian
         Output sample;

@@ -28,7 +28,39 @@ ROOT = HERE.parent.parent
 
 # Architectures wired into the NDEBENCH_*_KERNEL macros (one struct per
 # architectures/<name>.slang, implementing IArchitecture).
-ARCHITECTURES = ("TMM", "HGGrid", "DFN", "DFL", "NSFLinear", "NSFQuadratic", "NSFRQS", "HDF")
+ARCHITECTURES = (
+    "TMM",
+    "HGGrid",
+    "DFN",
+    "DFL",
+    "NSFLinear",
+    "NSFQuadratic",
+    "NSFRQS",
+    "HDF",
+    "HDFG4L3",
+    "HDFG3L4",
+    "HDFG4L3B",
+    "HDFG3L4B",
+    "HDFG4L3S",
+    "HGGridG2L3",
+    "HGGridG2L3B",
+    "HGGridG4L2",
+    "HGGridG4L2B",
+    "HGGridG4L2S",
+    # Winners of a depth/width/gaussian-count/geometry screening sweep -- see
+    # FINDING.md's HDF/HGGrid optimal-config entry and this file's
+    # *_levels_layout() helpers.
+    "HDFFastest",
+    "HDFFast",
+    "HGGridFastest",
+    "HGGridFast",
+    # Bin-matched to NSFLinear's kNumBins=16, isolating "explicit histogram/piecewise-
+    # linear density vs. NSF-L's coupling-flow spline" from "resolution" -- see FINDING.md's
+    # DF-vs-NSF training-speed entry (DFN/DFL's default 32 bins pay for 2x NSF-L's
+    # Histogram<K>::eval/sample unrolled-loop width, autodiff'd every training step).
+    "DFN16",
+    "DFL16",
+)
 
 # Module and entry-point prefix each REGISTRY kind's kernel lives under,
 # mirroring the *_KERNEL macro invocations in the corresponding .slang file
@@ -61,6 +93,24 @@ def aligned4(n: int) -> int:
 # by hand since Slang has no host-side reflection for this; a mismatch here
 # throws in compute_layout's caller (the cross-check against the shader's own
 # getParamCount(), see make_runner) rather than silently mis-sizing buffers.
+def hdf_levels_layout(g: int, l: int, hid: int, kbins: int, depth: int = 3) -> list[tuple[int, int, int, int]]:
+    """Mirrors architectures/HDFLevels.slang's HDFLevels<G,L,HID,ENC,KBINS,DEPTH>
+    MLP<> chain: root (1, HID, DEPTH, G*G) then L-1 x (1 + 2*KBINS, HID, DEPTH, G*G)."""
+    root = (1, hid, depth, g * g)
+    rest = (1 + 2 * kbins, hid, depth, g * g)
+    return [root] + [rest] * (l - 1)
+
+
+def hggrid_levels_layout(
+    g: int, l: int, hid: int, kbins: int, k: int, depth: int = 3
+) -> list[tuple[int, int, int, int]]:
+    """Mirrors architectures/HGGridLevels.slang's HGGridLevels<G,L,HID,ENC,KBINS,K,DEPTH>
+    MLP<> chain: hdf_levels_layout's own L-level histogram cascade, plus a final
+    continuous GMM head (1 + 2*KBINS, HID, DEPTH, K*5)."""
+    fine = (1 + 2 * kbins, hid, depth, k * 5)
+    return hdf_levels_layout(g, l, hid, kbins, depth) + [fine]
+
+
 MLP_LAYOUTS: dict[str, list[tuple[int, int, int, int]]] = {
     "TMM": [(1, 32, 3, 16 * 5)],  # Net: K=16
     "HGGrid": [(1, 32, 3, 64), (1 + 16, 32, 3, 4 * 5)],  # CoarseNet, FineNet: K=4
@@ -70,7 +120,47 @@ MLP_LAYOUTS: dict[str, list[tuple[int, int, int, int]]] = {
     "NSFQuadratic": [(1 + 32, 32, 3, 33), (1 + 32, 32, 3, 33)],  # kSplineOut = 2*16+1
     "NSFRQS": [(1 + 32, 32, 3, 47), (1 + 32, 32, 3, 47)],  # kSplineOut = 3*16-1
     "HDF": [(1, 32, 3, 64), (1 + 16, 32, 3, 64)],  # CoarseNet, FineNet
+    # HDFLevels<G,L,HID,ENC,KBINS,DEPTH> variants (architectures/HDFLevels.slang);
+    # geometry/encoding in each typealias's own comment there. KBINS = G*(L-1)
+    # (one-hot, ENC=0) or the noted fixed width (one-blob, ENC=1).
+    "HDFG4L3": hdf_levels_layout(4, 3, 32, 8),  # one-hot(KBINS=8)
+    "HDFG3L4": hdf_levels_layout(3, 4, 32, 9),  # one-hot(KBINS=9)
+    "HDFG4L3B": hdf_levels_layout(4, 3, 32, 8),  # one-blob(KBINS=8)
+    "HDFG3L4B": hdf_levels_layout(3, 4, 32, 8),  # one-blob(KBINS=8)
+    "HDFG4L3S": hdf_levels_layout(4, 3, 16, 8),  # one-blob(KBINS=8), HID=16
+    "HDFFastest": hdf_levels_layout(4, 3, 32, 8, depth=2),
+    "HDFFast": hdf_levels_layout(8, 2, 32, 8, depth=2),
+    # HGGridLevels<G,L,HID,ENC,KBINS,K,DEPTH> variants (architectures/HGGridLevels.slang);
+    # geometry/encoding in each typealias's own comment there. KBINS = G*L (one-hot,
+    # ENC=0) or the noted fixed width (one-blob, ENC=1).
+    "HGGridG2L3": hggrid_levels_layout(2, 3, 32, 6, 4),  # one-hot(KBINS=6), K=4
+    "HGGridG2L3B": hggrid_levels_layout(2, 3, 32, 8, 4),  # one-blob(KBINS=8), K=4
+    "HGGridG4L2": hggrid_levels_layout(4, 2, 32, 8, 4),  # one-hot(KBINS=8), K=4
+    "HGGridG4L2B": hggrid_levels_layout(4, 2, 32, 8, 4),  # one-blob(KBINS=8), K=4
+    "HGGridG4L2S": hggrid_levels_layout(4, 2, 16, 8, 4),  # one-blob(KBINS=8), K=4, HID=16
+    "HGGridFastest": hggrid_levels_layout(8, 1, 32, 8, 4, depth=2),
+    "HGGridFast": hggrid_levels_layout(4, 2, 16, 8, 8),
+    # DFN/DFL with per-axis bin count K=16 instead of the default 32 (architectures/
+    # DFN.slang's DFNImpl<K>/DFL.slang's DFLImpl<K>), bin-matched to NSFLinear's
+    # kNumBins=16 -- see the ARCHITECTURES tuple's own comment.
+    "DFN16": [(1, 16, 3, 16), (1 + 12, 16, 3, 16)],  # XNet, YNet
+    "DFL16": [(1, 16, 3, 16), (1 + 12, 16, 3, 16)],  # XNet, YNet
 }
+
+
+def trainable_params(mlp_specs: list[tuple[int, int, int, int]]) -> int:
+    """Sum of weight+bias element counts (naive, not TrainingOptimal-padded) over every
+    MLP<INPUT,HIDDEN,DEPTH,OUTPUT> block in `mlp_specs` -- the actual number of
+    trainable parameters, as distinct from `parameter_elements_fp16` (compute_layout's
+    device-padded buffer size, which is larger due to TrainingOptimal's real per-matrix
+    byte size -- see compute_layout's own doc comment). Needs no device/GPU."""
+    total = 0
+    for input_dim, hidden, depth, output in mlp_specs:
+        for l in range(depth + 1):
+            in_size = input_dim if l == 0 else hidden
+            out_size = output if l == depth else hidden
+            total += in_size * out_size + out_size
+    return total
 
 
 def compute_layout(device: spy.Device, mlp_specs: list[tuple[int, int, int, int]]) -> tuple[np.ndarray, int]:
@@ -848,6 +938,7 @@ def run_architecture(
     )
     return {
         "metadata": {
+            "trainable_parameters": trainable_params(MLP_LAYOUTS[arch]),
             "parameter_elements_fp16": r.elements_by_arch[arch],
             "padded_parameter_elements": r.padded_by_arch[arch],
         },

@@ -52,8 +52,45 @@ DISPLAY_LABELS = {
     "TMM": "TMM",
     "HDF": "HDF",
     "HGGrid": "HGGrid",
+    "HDFG4L3": "HDF-G4L3",
+    "HDFG3L4": "HDF-G3L4",
+    "HDFG4L3B": "HDF-G4L3-blob",
+    "HDFG3L4B": "HDF-G3L4-blob",
+    "HDFG4L3S": "HDF-G4L3-blob-s",
+    "HGGridG2L3": "HGGrid-G2L3",
+    "HGGridG2L3B": "HGGrid-G2L3-blob",
+    "HGGridG4L2": "HGGrid-G4L2",
+    "HGGridG4L2B": "HGGrid-G4L2-blob",
+    "HGGridG4L2S": "HGGrid-G4L2-blob-s",
+    "HDFFastest": "HDF-G4L3-H32D2",
+    "HDFFast": "HDF-G8L2-H32D2",
+    "HGGridFastest": "HGGrid-G8L1-H32D2-K4",
+    "HGGridFast": "HGGrid-G4L2-H16D3-K8",
 }
-DISPLAY_ORDER = ["NSFLinear", "NSFQuadratic", "NSFRQS", "DFN", "DFL", "TMM", "HDF", "HGGrid"]
+DISPLAY_ORDER = [
+    "NSFLinear",
+    "NSFQuadratic",
+    "NSFRQS",
+    "DFN",
+    "DFL",
+    "TMM",
+    "HDF",
+    "HGGrid",
+    "HDFG4L3",
+    "HDFG3L4",
+    "HDFG4L3B",
+    "HDFG3L4B",
+    "HDFG4L3S",
+    "HGGridG2L3",
+    "HGGridG2L3B",
+    "HGGridG4L2",
+    "HGGridG4L2B",
+    "HGGridG4L2S",
+    "HDFFastest",
+    "HDFFast",
+    "HGGridFastest",
+    "HGGridFast",
+]
 
 LOGPDF_DOWNSAMPLE = 4
 
@@ -127,6 +164,7 @@ def main() -> None:
         result = architectures[method]
         fm = result["final_metrics"]
         timing = result["timing"]
+        meta = result.get("metadata", {})
         final_rows.append((
             method,
             fm["kl_divergence"],
@@ -136,11 +174,13 @@ def main() -> None:
             timing["mean_training_ms_per_update"],
             timing["pdf_evaluation"]["mean_ms"],
             timing["sampling"]["mean_ms"],
+            meta.get("trainable_parameters"),
+            meta.get("parameter_elements_fp16"),
         ))
     write_csv(
         data_dir / "finals.csv",
         ["method", "kl", "variance", "importance_ratio_mean", "degenerate_fraction",
-         "train_ms", "eval_ms", "sample_ms"],
+         "train_ms", "eval_ms", "sample_ms", "params", "buffer_elements"],
         final_rows,
     )
 
