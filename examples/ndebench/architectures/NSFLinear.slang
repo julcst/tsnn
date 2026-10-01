@@ -127,4 +127,45 @@ struct NSFLinear : IArchitecture
         }
         return float2(x0, x1) + 0.5f;
     }
+
+    // Deterministic mirror of sample() for layers_viz's Stages.slang: the
+    // fixed prior latent (0.5,0.5) (i.e. z=(0,0), the exact center of the
+    // uniform box) run through the same two coupling steps sample() uses --
+    // no randomness needed at all beyond the fixed prior, since plInverse is
+    // a deterministic bijection given z. Not used by evalLogPDF/sample/
+    // training.
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        let z = kPrior.sample(float2(0.5f, 0.5f));
+        float x0 = z.x, x1 = z.y;
+        prior = float2(x0, x1) + 0.5f;
+        {
+            let p = CondMLP.forward<Activation>(weights, layout, kMLP1Base, condInput(ctx, x1));
+            let r = plInverse<kNumBins>(x0, p, kDomain);
+            x0 = r.value;
+        }
+        afterLayer1 = float2(x0, x1) + 0.5f;
+        {
+            let p = CondMLP.forward<Activation>(weights, layout, kMLP0Base, condInput(ctx, x0));
+            let r = plInverse<kNumBins>(x1, p, kDomain);
+            x1 = r.value;
+        }
+        outFinal = float2(x0, x1) + 0.5f;
+    }
+
+    // Exact (no sampling, no integration) layer-1-only log-density at a query
+    // point z0Query (same [-kDomain,kDomain) data/latent coordinate evalLogPDF
+    // itself uses): invert generative layer 1's transform (data x0 -> latent
+    // z0) via plForward, conditioned on the SAME fixed, still-latent z1=0
+    // that sampleTrajectoryFixed's hero trajectory uses, then finish exactly
+    // the way evalLogPDF finishes each block -- log p_prior(z0) + logAbsDet.
+    // Layer 2 (kMLP0) simply isn't applied.
+    static float stage1LogDensityX0(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff float z0Query)
+    {
+        let p = CondMLP.forward<Activation>(weights, layout, kMLP1Base, condInput(ctx, 0.0f));
+        let r = plForward<kNumBins>(z0Query, p, kDomain);
+        return kPrior.logProb(float2(r.value, 0.0f)) + r.logAbsDet;
+    }
 }

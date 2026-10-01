@@ -121,4 +121,42 @@ struct HDF : IArchitecture
         float2 jitter = float2(rand.nextFloat(), rand.nextFloat());
         return (float2(coarseCell) * float(kFineDim) + float2(fineCell) + jitter) / float(kFinestRes);
     }
+
+    // Deterministic mirror of sample() for layers_viz's Stages.slang: every
+    // "random" draw sample() would make is instead the fixed quantile 0.5,
+    // so the traced trajectory is a reproducible "typical" sample instead of
+    // one realization of many. Not used by evalLogPDF/sample/training.
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        prior = float2(0.5f, 0.5f);
+
+        Histogram<kNumCoarseCells> coarseHist;
+        let coarseLogits = forwardCoarse(weights, layout, ctx);
+        uint coarseBin = coarseHist.sample(coarseLogits, 0.5f);
+        uint2 coarseCell = bin2grid(coarseBin, kCoarseDim);
+        afterLayer1 = (float2(coarseCell) + float2(0.5f, 0.5f)) / float(kCoarseDim);
+
+        Histogram<kNumFineCells> fineHist;
+        let fineLogits = forwardFine(weights, layout, ctx, coarseCell);
+        uint fineBin = fineHist.sample(fineLogits, 0.5f);
+        uint2 fineCell = bin2grid(fineBin, kFineDim);
+        float2 jitter = float2(0.5f, 0.5f);
+        outFinal = (float2(coarseCell) * float(kFineDim) + float2(fineCell) + jitter) / float(kFinestRes);
+    }
+
+    // Exact (no sampling) coarse-cell probability mass, after layer 1 only --
+    // forwardCoarse's logits don't depend on any continuous input (ctx is
+    // IArchitecture's trivial constant), so this is a single small softmax
+    // read-back, not a histogram of samples.
+    static float[kNumCoarseCells] stage1MarginalCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx)
+    {
+        let logits = forwardCoarse(weights, layout, ctx);
+        Histogram<kNumCoarseCells> hist;
+        float probs[kNumCoarseCells];
+        [ForceUnroll]
+        for (uint i = 0; i < kNumCoarseCells; ++i) probs[i] = exp(hist.eval(logits, i));
+        return probs;
+    }
 }

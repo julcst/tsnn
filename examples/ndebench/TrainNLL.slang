@@ -12,6 +12,7 @@ import architectures.NSFRQS;
 import architectures.HDF;
 import architectures.HDFLevels;
 import architectures.HGGridLevels;
+import architectures.HGGridGMM;
 
 ByteAddressBuffer gParams;
 RWByteAddressBuffer gParamGrads;
@@ -74,3 +75,9 @@ NDEBENCH_TRAIN_NLL_KERNEL(HDFFastest)
 NDEBENCH_TRAIN_NLL_KERNEL(HDFFast)
 NDEBENCH_TRAIN_NLL_KERNEL(HGGridFastest)
 NDEBENCH_TRAIN_NLL_KERNEL(HGGridFast)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridGMM16)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridGMM16Fast)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridGMM16KC24)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridFastK12)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridFastK16)
+NDEBENCH_TRAIN_NLL_KERNEL(HGGridG4L3)

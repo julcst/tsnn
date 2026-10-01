@@ -9,6 +9,7 @@ import architectures.NSFRQS;
 import architectures.HDF;
 import architectures.HDFLevels;
 import architectures.HGGridLevels;
+import architectures.HGGridGMM;
 
 RWStructuredBuffer<uint> gMetadata;
 StructuredBuffer<uint2> gLayout;
@@ -49,3 +50,9 @@ NDEBENCH_METADATA_KERNEL(HDFFastest)
 NDEBENCH_METADATA_KERNEL(HDFFast)
 NDEBENCH_METADATA_KERNEL(HGGridFastest)
 NDEBENCH_METADATA_KERNEL(HGGridFast)
+NDEBENCH_METADATA_KERNEL(HGGridGMM16)
+NDEBENCH_METADATA_KERNEL(HGGridGMM16Fast)
+NDEBENCH_METADATA_KERNEL(HGGridGMM16KC24)
+NDEBENCH_METADATA_KERNEL(HGGridFastK12)
+NDEBENCH_METADATA_KERNEL(HGGridFastK16)
+NDEBENCH_METADATA_KERNEL(HGGridG4L3)

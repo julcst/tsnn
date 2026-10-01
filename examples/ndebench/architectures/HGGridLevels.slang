@@ -252,3 +252,31 @@ typealias HGGridG4L2S = HGGridLevels<4u, 2u, 16u, 1u, 8u, 4u>; // HGGridG4L2B wi
 // grid for quality, and MLP depth (3->2) the far bigger lever for speed.
 typealias HGGridFast    = HGGridLevels<4u, 2u, 16u, 0u, 8u, 8u>;     // HGGridG4L2 geometry, HID=16, K=8: better KL AND faster than HGGrid -- recommended default
 typealias HGGridFastest = HGGridLevels<8u, 1u, 32u, 0u, 8u, 4u, 2u>; // HGGrid's own geometry, depth 2: fastest, KL ~= HGGrid
+
+// NOTE: a single-level 16x16 = 256-cell joint softmax (the literal "just
+// make HGGrid's own one-level grid finer" reading) is NOT expressible as an
+// HGGridLevels<16u, 1u, ...> instantiation on this hardware -- its root
+// head's 256-wide output row exceeds the CoopVec TrainingOptimal matrix's
+// 128-row cap (`IDevice::getCooperativeVectorMatrixSize: Row count must be
+// in the range [1, 128]`), confirmed live. See architectures/HGGridRC.slang
+// (HGGridRC16) for the row/col-factored version that reaches the same
+// resolution within that cap.
+
+// Follow-up sweep: FINDING.md's optimal-config entry concluded K (GMM head
+// Gaussian count) is a far better quality lever than discrete grid
+// resolution, but only ever compared K=4 vs K=8 -- these push the same
+// HGGridFast geometry's K further to see whether that lever keeps paying off
+// or plateaus/overfits the per-cell shape budget.
+typealias HGGridFastK12 = HGGridLevels<4u, 2u, 16u, 0u, 8u, 12u>; // HGGridFast, K=8 -> 12
+typealias HGGridFastK16 = HGGridLevels<4u, 2u, 16u, 0u, 8u, 16u>; // HGGridFast, K=8 -> 16
+
+// Applies HDFLevels' own winning pattern (HDFG4L3: reach the SAME finest
+// resolution via 3 narrow 4x4 heads instead of 2 wide 8x8 heads, cheaper per
+// step for equal quality -- see FINDING.md's HDF narrowing entry) to HGGrid,
+// which was never tried: the existing HGGridLevels sweep only compared
+// DIFFERENT resolutions (G2L3 res 8, G4L2 res 16, G8L1 res 8) or the same
+// resolution at full HID32 (G8L2, tied HGGridFast's KL at ~3x the cost) --
+// never a narrow-cascade-at-res-64 config combined with HGGridFast's other
+// two proven levers (HID=16, depth=2). KBINS=12=G*L per the one-hot (ENC=0)
+// convention documented on the struct above.
+typealias HGGridG4L3 = HGGridLevels<4u, 3u, 16u, 0u, 12u, 8u, 2u>; // 3x(4x4), res 64, HID=16, K=8, depth=2

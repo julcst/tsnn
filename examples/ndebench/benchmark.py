@@ -54,6 +54,20 @@ ARCHITECTURES = (
     "HDFFast",
     "HGGridFastest",
     "HGGridFast",
+    # "Discretized GMM": the cell itself is chosen by a small CONTINUOUS
+    # TruncatedGMM (sample it, round the draw onto a 16x16 grid) instead of a
+    # learned NxN histogram -- see architectures/HGGridGMM.slang. As distinct
+    # from HGGridFast's 2-level histogram cascade to a coarser per-level 4x4.
+    "HGGridGMM16",
+    "HGGridGMM16Fast",
+    "HGGridGMM16KC24",
+    # Follow-up to the sweep above: pushes HGGridFast's K lever further
+    # (K=12/16) and applies HDFLevels' "narrow cascade at the SAME finest
+    # resolution" pattern to HGGrid for the first time (G4L3, res 64) --
+    # see architectures/HGGridLevels.slang's own comments on these typealiases.
+    "HGGridFastK12",
+    "HGGridFastK16",
+    "HGGridG4L3",
     # Bin-matched to NSFLinear's kNumBins=16, isolating "explicit histogram/piecewise-
     # linear density vs. NSF-L's coupling-flow spline" from "resolution" -- see FINDING.md's
     # DF-vs-NSF training-speed entry (DFN/DFL's default 32 bins pay for 2x NSF-L's
@@ -140,6 +154,15 @@ MLP_LAYOUTS: dict[str, list[tuple[int, int, int, int]]] = {
     "HGGridG4L2S": hggrid_levels_layout(4, 2, 16, 8, 4),  # one-blob(KBINS=8), K=4, HID=16
     "HGGridFastest": hggrid_levels_layout(8, 1, 32, 8, 4, depth=2),
     "HGGridFast": hggrid_levels_layout(4, 2, 16, 8, 8),
+    # HGGridGMM<G,HID,KC,KF,DEPTH> (architectures/HGGridGMM.slang): coarse
+    # TruncatedGMM<KC> (rounded onto a GxG grid) + fine TruncatedGMM<KF> tail.
+    # MLP chain: CoarseNet (1, HID, DEPTH, KC*5), FineNet (1+2G, HID, DEPTH, KF*5).
+    "HGGridGMM16": [(1, 32, 3, 8 * 5), (1 + 32, 32, 3, 8 * 5)],
+    "HGGridGMM16Fast": [(1, 16, 2, 8 * 5), (1 + 32, 16, 2, 8 * 5)],
+    "HGGridGMM16KC24": [(1, 32, 3, 24 * 5), (1 + 32, 32, 3, 8 * 5)],
+    "HGGridFastK12": hggrid_levels_layout(4, 2, 16, 8, 12),
+    "HGGridFastK16": hggrid_levels_layout(4, 2, 16, 8, 16),
+    "HGGridG4L3": hggrid_levels_layout(4, 3, 16, 12, 8, depth=2),
     # DFN/DFL with per-axis bin count K=16 instead of the default 32 (architectures/
     # DFN.slang's DFNImpl<K>/DFL.slang's DFLImpl<K>), bin-matched to NSFLinear's
     # kNumBins=16 -- see the ARCHITECTURES tuple's own comment.

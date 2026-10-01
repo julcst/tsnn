@@ -14,6 +14,7 @@ import architectures.NSFRQS;
 import architectures.HDF;
 import architectures.HDFLevels;
 import architectures.HGGridLevels;
+import architectures.HGGridGMM;
 
 /// float16 gradients written by train, read-only
 StructuredBuffer<half4> gParamGrads;
@@ -106,6 +107,12 @@ NDEBENCH_RESET_KERNEL(HDFFastest)
 NDEBENCH_RESET_KERNEL(HDFFast)
 NDEBENCH_RESET_KERNEL(HGGridFastest)
 NDEBENCH_RESET_KERNEL(HGGridFast)
+NDEBENCH_RESET_KERNEL(HGGridGMM16)
+NDEBENCH_RESET_KERNEL(HGGridGMM16Fast)
+NDEBENCH_RESET_KERNEL(HGGridGMM16KC24)
+NDEBENCH_RESET_KERNEL(HGGridFastK12)
+NDEBENCH_RESET_KERNEL(HGGridFastK16)
+NDEBENCH_RESET_KERNEL(HGGridG4L3)
 
 [numthreads(256, 1, 1)]
 void optimize(uint3 tid: SV_DispatchThreadID)

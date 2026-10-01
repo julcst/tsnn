@@ -108,6 +108,46 @@ struct DFNImpl<let K : uint> : IArchitecture
 
         return float2(x, y);
     }
+
+    // Deterministic mirror of sample() for layers_viz's Stages.slang: every
+    // "random" draw sample() would make (bin select, within-bin jitter) is
+    // instead the fixed quantile 0.5 -- the median bin, jittered to its own
+    // center -- so the traced trajectory is a reproducible "typical" sample
+    // instead of one realization of many. Not used by evalLogPDF/sample/
+    // training. prior is the fixed (0.5,0.5): DFN has no continuous prior/
+    // latent concept of its own, only two rounds of (bin draw, jitter).
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        prior = float2(0.5f, 0.5f);
+
+        Histogram<kX> histX;
+        let histXLogits = forwardX(weights, layout, ctx);
+        let binX = histX.sample(histXLogits, 0.5f);
+        let x = (float(binX) + 0.5f) / float(kX);
+        afterLayer1 = float2(x, prior.y);
+
+        Histogram<kY> histY;
+        let histYLogits = forwardY(weights, layout, ctx, x);
+        let binY = histY.sample(histYLogits, 0.5f);
+        let y = (float(binY) + 0.5f) / float(kY);
+        outFinal = float2(x, y);
+    }
+
+    // Exact (no sampling) marginal-over-X probability mass per bin, after
+    // layer 1 only -- forwardX's logits don't depend on any continuous
+    // input (ctx is IArchitecture's trivial constant), so this is a single
+    // small softmax read-back, not a histogram of samples.
+    static float[kX] stage1MarginalX(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx)
+    {
+        let logits = forwardX(weights, layout, ctx);
+        Histogram<kX> hist;
+        float probs[kX];
+        [ForceUnroll]
+        for (uint i = 0; i < kX; ++i) probs[i] = exp(hist.eval(logits, i));
+        return probs;
+    }
 }
 
 typealias DFN = DFNImpl<32u>;

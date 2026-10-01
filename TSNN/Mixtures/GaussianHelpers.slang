@@ -384,6 +384,64 @@ void logTruncMass_bwd(inout DifferentialPair<float> dpMean, inout DifferentialPa
     dpLogSigma = diffPair(logSigma, dOut * dLogSigma);
 }
 
+// log P(lo <= X <= hi) for X ~ N(mean, sigma^2) -- `logTruncMass` generalized
+// from its hardcoded [0,1] normalization interval to an arbitrary [lo, hi]
+// (a grid cell's bounds along one axis, used by TruncatedGMM.evalCellMass to
+// get a discretized-GMM architecture's per-cell probability mass in closed
+// form, no MLP histogram head needed at all). `lo`/`hi` are no_diff: they're
+// fixed grid-cell boundaries, not learnable. Forward AND backward are the
+// exact same derivation as `logTruncMass`/`logTruncMass_bwd` -- both only
+// ever use zLo=(a-mean)/sigma, zHi=(b-mean)/sigma for constants a, b via the
+// chain rule, nothing in either derivation is specific to a=0, b=1 -- so
+// `logTruncMass(mean, logSigma)` is exactly `logIntervalMass(mean, logSigma,
+// 0.0f, 1.0f)`. Kept as a separate top-level function rather than a
+// call-through wrapper since `logTruncMass` is on TruncatedGMM's hot path
+// (every eval/sample call, both axes) and this file's own convention already
+// favors a few duplicated lines over an extra call for core numerics.
+[BackwardDerivative(logIntervalMass_bwd)]
+float logIntervalMass(float mean, float logSigma, no_diff float lo, no_diff float hi)
+{
+    let invSigma = exp(-logSigma);
+    let zLo = (lo - mean) * invSigma;
+    let zHi = (hi - mean) * invSigma; // zHi > zLo always (hi > lo)
+
+    if (zLo < 0.0f && zHi > 0.0f)
+    {
+        let invSqrt2 = 1.0f / sqrt(2.0f);
+        return log(0.5f * (erf(zHi * invSqrt2) - erf(zLo * invSqrt2)));
+    }
+
+    let reflect = zLo >= 0.0f;
+    let rLo = reflect ? -zHi : zLo;
+    let rHi = reflect ? -zLo : zHi;
+
+    let logHi = logNormalCDF(rHi);
+    let logLo = logNormalCDF(rLo);
+    return logHi + log1mexp(logLo - logHi);
+}
+
+void logIntervalMass_bwd(
+    inout DifferentialPair<float> dpMean, inout DifferentialPair<float> dpLogSigma,
+    no_diff float lo, no_diff float hi, float dOut)
+{
+    let mean = dpMean.p;
+    let logSigma = dpLogSigma.p;
+    let invSigma = exp(-logSigma);
+    let zLo = (lo - mean) * invSigma;
+    let zHi = (hi - mean) * invSigma;
+
+    let logM = logIntervalMass(mean, logSigma, lo, hi);
+    let logNormConst = -0.5f * log(2.0f * float.getPi());
+    let ratioLo = exp(logNormConst - 0.5f * zLo * zLo - logM); // phi(zLo) / M
+    let ratioHi = exp(logNormConst - 0.5f * zHi * zHi - logM); // phi(zHi) / M
+
+    let dMean = (ratioLo - ratioHi) * invSigma;
+    let dLogSigma = zLo * ratioLo - zHi * ratioHi;
+
+    dpMean = diffPair(mean, dOut * dMean);
+    dpLogSigma = diffPair(logSigma, dOut * dLogSigma);
+}
+
 [Differentiable]
 float logTruncGaussianPDF(float2 x, float2 mean, float2 logSigma)
 {

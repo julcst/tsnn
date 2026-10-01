@@ -105,4 +105,41 @@ struct HGGrid : IArchitecture
 
         return (float2(cell) + t) / float(kGridDim);
     }
+
+    // Deterministic mirror of sample() for layers_viz's Stages.slang: every
+    // "random" draw sample() would make is instead the fixed quantile 0.5
+    // (median coarse cell, its highest-probability-quantile GMM component,
+    // its own median point), so the traced trajectory is a reproducible
+    // "typical" sample instead of one realization of many. Not used by
+    // evalLogPDF/sample/training.
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        prior = float2(0.5f, 0.5f);
+
+        Histogram<kNumCells> hist;
+        let histLogits = forwardCoarse(weights, layout, ctx);
+        uint bin = hist.sample(histLogits, 0.5f);
+        uint2 cell = bin2grid(bin, kGridDim);
+        afterLayer1 = (float2(cell) + float2(0.5f, 0.5f)) / float(kGridDim);
+
+        let fineParams = forwardFine(weights, layout, ctx, cell);
+        float2 t = kGMM.sampleAt(fineParams, 0.5f, float2(0.5f, 0.5f));
+        outFinal = (float2(cell) + t) / float(kGridDim);
+    }
+
+    // Exact (no sampling) coarse-cell probability mass, after layer 1 only --
+    // forwardCoarse's logits don't depend on any continuous input (ctx is
+    // IArchitecture's trivial constant), so this is a single small softmax
+    // read-back, not a histogram of samples.
+    static float[kNumCells] stage1MarginalCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx)
+    {
+        let logits = forwardCoarse(weights, layout, ctx);
+        Histogram<kNumCells> hist;
+        float probs[kNumCells];
+        [ForceUnroll]
+        for (uint i = 0; i < kNumCells; ++i) probs[i] = exp(hist.eval(logits, i));
+        return probs;
+    }
 }

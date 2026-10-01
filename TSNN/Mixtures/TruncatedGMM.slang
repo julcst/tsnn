@@ -52,6 +52,51 @@ struct TruncatedGMM<uint N>
         return logSumExp(logits) - logSumExp(logWeights); // Normalize by the sum of weights
     }
 
+    /**
+    * Closed-form log probability MASS of this truncated GMM inside an
+    * axis-aligned box [lo, hi] subset of [0,1]^2 (e.g. one cell of a
+    * discretization grid) -- the continuous-GMM analog of a learned
+    * histogram's per-bin log-probability, but with a parameter count that
+    * doesn't scale with the grid resolution: only the box's own boundaries
+    * change per cell, not this GMM's K components. Per component, the mass
+    * factorizes into independent per-axis interval masses (the joint
+    * Gaussian's covariance is diagonal) divided by that same component's own
+    * [0,1] truncation mass (logTruncMass) -- exactly logTruncGaussianPDF's
+    * own normalization term, just replacing the pointwise Gaussian PDF/
+    * exponent with GaussianHelpers.logIntervalMass's own box-mass term.
+    * @param input An array containing the weights, means, and sigmas
+    * @param lo Box lower corner, component-wise >= 0
+    * @param hi Box upper corner, component-wise <= 1 and > lo
+    * @return log P(lo <= X <= hi)
+    */
+    [Differentiable]
+    float evalCellMass<T : IFloat>(T input[N * STRIDE], no_diff Output lo, no_diff Output hi)
+    {
+        float logits[N];
+        float logWeights[N];
+
+        [ForceUnroll]
+        for (uint i = 0; i < N; ++i)
+        {
+            let offset = i * STRIDE;
+            let logWeight = input[offset + 0].toFloat();
+            let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat());
+            let logSigma = Output(
+                clamp(input[offset + 3].toFloat(), -kLogSigmaMax, kLogSigmaMax),
+                clamp(input[offset + 4].toFloat(), -kLogSigmaMax, kLogSigmaMax));
+
+            float logMass = 0.0f;
+            [ForceUnroll]
+            for (uint d = 0; d < D; ++d)
+                logMass += logIntervalMass(mean[d], logSigma[d], lo[d], hi[d]) - logTruncMass(mean[d], logSigma[d]);
+
+            logits[i] = logWeight + logMass;
+            logWeights[i] = logWeight;
+        }
+
+        return logSumExp(logits) - logSumExp(logWeights);
+    }
+
     Output sample<T : IFloat>(T input[N * STRIDE], inout PCG32 rand)
     {
         float[N] logWeights;
@@ -80,6 +125,40 @@ struct TruncatedGMM<uint N>
             sample[d] = normalCDFInverse(u, mean[d], logSigma[d]);
         }
 
+        return sample;
+    }
+
+    // Deterministic counterpart of sample(): takes explicit uniform values
+    // instead of drawing from `inout PCG32 rand`, so a caller can ask for a
+    // reproducible "typical" draw (e.g. uComponent=uAxis=0.5 -> the
+    // highest-cumulative-probability-quantile component's own median point)
+    // instead of a random realization. Used by HGGrid's layers_viz
+    // instrumentation (architectures/HGGrid.slang's sampleTrajectoryFixed).
+    Output sampleAt<T : IFloat>(T input[N * STRIDE], float uComponent, Output uAxis)
+    {
+        float[N] logWeights;
+        [ForceUnroll]
+        for (uint i = 0; i < N; ++i)
+        {
+            logWeights[i] = input[i * STRIDE].toFloat();
+        }
+        let bin = sampleSoftmax(logWeights, uComponent);
+
+        let offset = bin * STRIDE;
+        let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat());
+        let logSigma = Output(
+            clamp(input[offset + 3].toFloat(), -kLogSigmaMax, kLogSigmaMax),
+            clamp(input[offset + 4].toFloat(), -kLogSigmaMax, kLogSigmaMax));
+
+        Output sample;
+        [ForceUnroll]
+        for (uint d = 0; d < D; ++d)
+        {
+            let cdfMin = normalCDF(0.0, mean[d], logSigma[d]);
+            let cdfMax = normalCDF(1.0, mean[d], logSigma[d]);
+            let u = cdfMin + uAxis[d] * (cdfMax - cdfMin);
+            sample[d] = normalCDFInverse(u, mean[d], logSigma[d]);
+        }
         return sample;
     }
 }
