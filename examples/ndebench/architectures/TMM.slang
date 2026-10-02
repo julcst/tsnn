@@ -36,7 +36,7 @@ struct TMM : IArchitecture
 
     [Differentiable]
     static float[K * 5] forward(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(Net.forward<Activation>(weights, layout, kBase, ctx));
+        return CoopVecToArray(Net.forwardStatic<NDEOffsets, Activation>(weights, ctx, kBase));
     }
 
     [Differentiable]

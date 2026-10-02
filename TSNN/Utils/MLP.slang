@@ -18,6 +18,14 @@ enum MLPInit
     LeCunNormal,    // N(0, 1/fan_in)             — SELU
 };
 
+// Implementations supply device-queried offsets as a compile-time array. The
+// matrix sizes are opaque to Slang, but the offsets are fixed for a pipeline.
+interface IMLPStaticLayout
+{
+    static uint2 offset(uint layer);
+    static uint paramCount();
+}
+
 // Per-scheme weight magnitude (std for the normal schemes, half-width for uniform).
 float initScale(MLPInit s, uint fanIn, uint fanOut)
 {
@@ -35,9 +43,9 @@ float initScale(MLPInit s, uint fanIn, uint fanOut)
 // layers total) as a purely static "namespace" over its own generic shape
 // parameters -- it holds no per-instance state, because there is none to
 // hold: every layer's byte layout in the shared parameter buffer is
-// host-supplied (a `layout` StructuredBuffer<uint2> of per-layer
-// (weightOffset, biasOffset) pairs, plus this block's own `base` index into
-// it), not computed here.
+// host-supplied. Callers can use a `layout` StructuredBuffer<uint2> and a
+// `base` index, or specialize the static methods with an IMLPStaticLayout
+// whose offsets come from a compile-time array.
 //
 // That's a hard requirement, not a style choice: `coopVecOuterProductAccumulate`
 // (the backward pass's gradient scatter, see TSNN.LinearOps) requires
@@ -60,7 +68,8 @@ float initScale(MLPInit s, uint fanIn, uint fanOut)
 // mirrors this file's own per-layer shape sequence (input, hidden, ...,
 // hidden, output) and queries the real per-layer weight-matrix size for
 // `LAYOUT`; see examples/ndebench/benchmark.py's `compute_layout()` for the
-// SlangPy version and each render pass's own C++ equivalent.
+// SlangPy version and each render pass's own C++ equivalent. The static path
+// embeds that builder's results in shader source before compiling kernels.
 struct MLP<
     let INPUT : uint,
     let HIDDEN : uint,
@@ -94,6 +103,70 @@ struct MLP<
         return end(layout, base) / uint(sizeof(half));
     }
 
+    static uint paramCountStatic<StaticLayout : IMLPStaticLayout>()
+    {
+        return StaticLayout.paramCount();
+    }
+
+    // base selects an MLP block in a shared static layout (DEPTH+1 entries).
+    // A link-time type lets callers supply device-queried offsets when linking.
+    /// NOTE: Static weight and bias offsets seem to have a dramatic performance advantage over runtime-fetched offsets
+    [Differentiable]
+    static CoopVec<half, OUTPUT> forwardStatic<
+        StaticLayout : IMLPStaticLayout, A : IActivation = LeakyReLU>(
+        MatrixBiasBuffer weights, CoopVec<half, INPUT> input, no_diff uint base = 0u, A act = A())
+    {
+        var h = LinearOp<half, HIDDEN>(input, weights, StaticLayout.offset(base), LAYOUT, COMPONENT_TYPE);
+        h = act.eval(h);
+        [ForceUnroll]
+        for (uint l = 1u; l < DEPTH; ++l)
+        {
+            h = LinearOp<half, HIDDEN>(h, weights, StaticLayout.offset(base + l), LAYOUT, COMPONENT_TYPE);
+            h = act.eval(h);
+        }
+        return LinearOp<half, OUTPUT>(h, weights, StaticLayout.offset(base + DEPTH), LAYOUT, COMPONENT_TYPE);
+    }
+
+    static float initValueStatic<StaticLayout : IMLPStaticLayout>(
+        uint localElem, MLPInit scheme, bool zeroLastLayer)
+    {
+        let byteOff = StaticLayout.offset(0u).x + localElem * uint(sizeof(half));
+        [ForceUnroll]
+        for (uint l = 0u; l < DEPTH + 1u; ++l)
+        {
+            let shape = layerShape(l);
+            let wStart = StaticLayout.offset(l).x;
+            let bStart = StaticLayout.offset(l).y;
+            if (byteOff >= bStart && byteOff < bStart + uint(sizeof(half)) * shape.y)
+                return 0.0f;
+            if (byteOff < wStart || byteOff >= bStart)
+                continue;
+            if (zeroLastLayer && l == DEPTH)
+                return 0.0f;
+            let draw = (scheme == MLPInit::HeUniform || scheme == MLPInit::XavierUniform)
+                ? 2.0f * uintToUnitFloat(pcg2d(uint2(byteOff, 0x85ebca6bu)).x) - 1.0f
+                : randNormal(uint2(byteOff, 0x9e3779b9u));
+            return initScale(scheme, shape.x, shape.y) * draw;
+        }
+        return 0.0f;
+    }
+
+    static void initParamsStatic<StaticLayout : IMLPStaticLayout, TMirror : IFloat, TMaster : IFloat>(
+        RWByteAddressBuffer params, RWByteAddressBuffer master,
+        uint tid, uint threadCount,
+        MLPInit scheme = MLPInit::HeNormal, bool zeroLastLayer = false)
+    {
+        let lo = StaticLayout.offset(0u).x / uint(sizeof(half));
+        let hi = StaticLayout.paramCount();
+        for (uint e = lo + tid; e < hi; e += threadCount)
+        {
+            let v = initValueStatic<StaticLayout>(e - lo, scheme, zeroLastLayer);
+            params.StoreAligned<TMirror>(e * uint(sizeof(TMirror)), TMirror(v));
+            master.StoreAligned<TMaster>(e * uint(sizeof(TMaster)), TMaster(v));
+        }
+    }
+
+    /// WARNING: Runtime-fetched offsets are slower than static offsets, so prefer forwardStatic if you can
     [Differentiable]
     static CoopVec<half, OUTPUT> forward<A : IActivation = LeakyReLU>(
         MatrixBiasBuffer weights, no_diff StructuredBuffer<uint2> layout, no_diff uint base,
@@ -150,7 +223,7 @@ struct MLP<
         return 0.0f; // alignment padding
     }
 
-    // Coalesced SOTA init of this block's parameters, stored as `T` (pass half for
+    // Coalesced init of this block's parameters, stored as `T` (pass half for
     // the coopvec compute buffer, float for a full-precision one).  Owns the whole
     // strided loop (reset is not perf critical), so callers just hand over the
     // dispatch's thread id / count — natural to call once per block on a multi-MLP

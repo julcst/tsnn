@@ -105,13 +105,13 @@ struct HGGridGMM<let G : uint, let HID : uint, let KC : uint, let KF : uint, let
 
     [Differentiable]
     static float[KC * 5] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(CoarseNet.forward<Activation>(weights, layout, coarseBase(), ctx));
+        return CoopVecToArray(CoarseNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, coarseBase()));
     }
 
     [Differentiable]
     static float[KF * 5] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 cell) {
         let input = composeFineInput(ctx, encodeCell(cell));
-        return CoopVecToArray(FineNet.forward<Activation>(weights, layout, fineBase(), input));
+        return CoopVecToArray(FineNet.forwardStatic<NDEOffsets, Activation>(weights, input, fineBase()));
     }
 
     // log p(x) = logCellMass(cell) + logFine(t) + 2*log(G): logCellMass is

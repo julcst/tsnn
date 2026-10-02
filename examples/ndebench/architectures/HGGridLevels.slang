@@ -155,11 +155,11 @@ struct HGGridLevels<
         no_diff uint pathX[L], no_diff uint pathY[L], uint level)
     {
         if (level == 0u) {
-            return CoopVecToArray(RootNet.forward<Activation>(weights, layout, levelBase(0u), ctx));
+            return CoopVecToArray(RootNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, levelBase(0u)));
         } else {
             let enc = encodeCell(pathX, pathY, level);
             let input = composeInput(ctx, enc);
-            return CoopVecToArray(RestNet.forward<Activation>(weights, layout, levelBase(level), input));
+            return CoopVecToArray(RestNet.forwardStatic<NDEOffsets, Activation>(weights, input, levelBase(level)));
         }
     }
 
@@ -170,7 +170,7 @@ struct HGGridLevels<
     {
         let enc = encodeCell(pathX, pathY, L);
         let input = composeInput(ctx, enc);
-        return CoopVecToArray(FineNet.forward<Activation>(weights, layout, fineBase(), input));
+        return CoopVecToArray(FineNet.forwardStatic<NDEOffsets, Activation>(weights, input, fineBase()));
     }
 
     // log p(x) = sum_i logHist_i(bin_i) + logFine(t) + 2*L*log(G): L nested

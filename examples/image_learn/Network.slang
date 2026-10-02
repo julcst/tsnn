@@ -8,6 +8,8 @@ import TSNN.CoopVec;
 import TSNN.Utils.Math;
 import TSNN.Utils.MLP;
 import TSNN.Activations;
+extern struct TrainingOffsets : IMLPStaticLayout;
+extern struct InferenceOffsets : IMLPStaticLayout;
 
 static constexpr const uint kHashLevels = 16u;
 static constexpr const uint kHashFeaturesPerLevel = 2u;
@@ -17,8 +19,7 @@ static constexpr const uint kHashBaseResolution = 16u;
 static constexpr const float kHashPerLevelScale = 1.5f;
 
 static constexpr const uint kEncodingParamElementCount = kHashLevels * kHashTableSize * kHashFeaturesPerLevel;
-static constexpr const MLP<kHashLevels * kHashFeaturesPerLevel, 64, 4, 3> kMLP = MLP<kHashLevels * kHashFeaturesPerLevel, 64, 4, 3>();
-static constexpr const uint kParamElementCount = kMLP.end / sizeof(half);
+typealias Net = MLP<kHashLevels * kHashFeaturesPerLevel, 64, 4, 3>;
 
 [Differentiable]
 CoopVec<half, 3> forward(FeatureBuffer encodingParams, MatrixBiasBuffer weights, no_diff float2 uv)
@@ -26,10 +27,20 @@ CoopVec<half, 3> forward(FeatureBuffer encodingParams, MatrixBiasBuffer weights,
     let input = encodeHashGrid<half, kHashLevels, kHashFeaturesPerLevel>(
         encodingParams, uv, kHashTableSize, float(kHashBaseResolution), kHashPerLevelScale);
 
-    return kMLP.forward<LeakyReLU>(weights, input);
+    return Net.forwardStatic<TrainingOffsets, LeakyReLU>(weights, input);
 }
 
 CoopVec<half, 3> forward(ByteAddressBuffer enc, ByteAddressBuffer w, no_diff float2 uv)
 {
     return forward(FeatureBuffer(enc), MatrixBiasBuffer(w), uv);
+}
+
+// Forward-only path: the host converts matrices and copies biases before use.
+CoopVec<half, 3> forwardInference(ByteAddressBuffer enc, ByteAddressBuffer w, float2 uv)
+{
+    let input = encodeHashGrid<half, kHashLevels, kHashFeaturesPerLevel>(
+        FeatureBuffer(enc), uv, kHashTableSize, float(kHashBaseResolution), kHashPerLevelScale);
+    return MLP<kHashLevels * kHashFeaturesPerLevel, 64, 4, 3,
+        CoopVecMatrixLayout::InferencingOptimal>.forwardStatic<InferenceOffsets, LeakyReLU>(
+            MatrixBiasBuffer(w), input);
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # dependencies = [
-#     "torch",
+#     "torch==2.8.0",
 #     "numpy",
 #     "tqdm",
 #     "pillow",
@@ -9,12 +9,16 @@
 # ]
 #
 # [tool.uv.extra-build-dependencies]
-# tinycudann = ["torch", "setuptools<81"]
+# tinycudann = ["torch==2.8.0", "setuptools<81"]
 # ///
 """Benchmark harness for tiny-cuda-nn (PyTorch bindings), configured to match
 TSNN's examples/image_learn/Network.slang exactly: same hash-grid encoding,
 same MLP shape, same Adam hyperparameters, same relative-L2-luminance loss,
 same batch size / step count. Compare against benchmark.py's output.
+
+PyTorch is pinned in both dependency lists because these tiny-cuda-nn bindings
+build as C++17; newer PyTorch headers require C++20. Build with a CUDA toolkit
+matching torch.version.cuda (CUDA 12.8 for the pinned Linux wheel).
 
 Note: tcnn's FullyFusedMLP kernel only supports ReLU hidden activations (its
 fastest path); TSNN uses LeakyReLU. This is the standard "fastest available"
@@ -154,10 +158,9 @@ def run(target: np.ndarray, device, steps: int, lr: float, eval_every: int, warm
         return uv, target_t[py, px]
 
     # tcnn's core CUDA kernels (the fused MLP itself) are precompiled
-    # ahead-of-time -- jit_fusion (--jit) instead lets PyTorch JIT-fuse the
-    # surrounding elementwise glue ops (padding/casts) into the fused kernel
-    # call, which is the closer analogue to TSNN not needing separate glue
-    # dispatches. Independently, the first CUDA call still pays for
+    # ahead-of-time -- jit_fusion (--jit) instead compiles the tiny-cuda-nn
+    # model into fused CUDA kernels at runtime. PyTorch sampling, loss, and
+    # optimizer operations remain outside those kernels. Independently, the first CUDA call still pays for
     # context/allocator/cuBLAS-handle init -- run a few throwaway steps
     # before timing, then reinit model+optimizer so the timed run trains
     # `steps` iterations from scratch (same convention as benchmark.py /

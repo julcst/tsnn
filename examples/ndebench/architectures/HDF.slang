@@ -67,13 +67,13 @@ struct HDF : IArchitecture
 
     [Differentiable]
     static float[kNumCoarseCells] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(CoarseNet.forward<Activation>(weights, layout, kCoarseBase, ctx));
+        return CoopVecToArray(CoarseNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, kCoarseBase));
     }
 
     [Differentiable]
     static float[kNumFineCells] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 coarseCell) {
         let input = ComposeCoopVecPlus(ctx, encodeCell(coarseCell));
-        let params = CoopVecToArray(FineNet.forward<Activation>(weights, layout, kFineBase, input));
+        let params = CoopVecToArray(FineNet.forwardStatic<NDEOffsets, Activation>(weights, input, kFineBase));
         return params;
     }
 

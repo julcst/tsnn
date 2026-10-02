@@ -1,4 +1,8 @@
 import TSNN.LinearOps;
+import TSNN.Utils.MLP;
+
+// Each linked architecture receives its own device-queried offsets.
+extern struct NDEOffsets : IMLPStaticLayout;
 import TSNN.Utils.PCG32;
 import TSNN.CoopVec;
 

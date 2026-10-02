@@ -56,29 +56,19 @@ frame):
 
 | Kernel | TSNN (Slang) | tiny-cuda-nn (JIT) | tiny-cuda-nn | vs JIT | vs plain |
 |---|---|---|---|---|---|
-| Training (fwd+bwd) | 472 us/step | 526 us/step | 644 us/step | 1.11x | 1.37x |
-| Optimizer step | 508 us/step | 560 us/step | 558 us/step | 1.10x | 1.10x |
-| Inference | 77 us/pass | 115 us/pass | 195 us/pass | 1.49x | 2.52x |
+| Training (fwd+bwd) | 488.6 us/step | 520.0 us/step | 646.5 us/step | 1.06x | 1.32x |
+| Optimizer step | 504.0 us/step | 551.1 us/step | 549.9 us/step | 1.09x | 1.09x |
+| Layout conversion | 8.5 us/pass | — | — | — | — |
+| Inference (converted weights) | 81.7 us/pass | 115.7 us/pass | 197.4 us/pass | 1.42x | 2.42x |
 
 Averaged over 5,000 training steps and 200 full-image (512x512) inference
-passes, batch 16,384, RTX 5070 Ti; "vs JIT"/"vs plain" are each tcnn column's
-time divided by TSNN's (>1x = TSNN faster). The JIT column enables tcnn's
-`jit_fusion` (`model.jit_fusion = True`, gated on
-`tcnn.supports_jit_fusion()`), which lets PyTorch JIT-fuse the elementwise
-glue around the fused kernel call instead of dispatching it separately —
-closer to what TSNN's fully-fused kernel does natively, and it closes a
-good chunk of the gap on every kernel. TSNN still wins across the board;
-tcnn reaches a higher final PSNR at this step count (JIT: 52.9 dB, plain:
-53.5 dB, vs. TSNN's 47.4 dB) — its hash grid adaptively shrinks unused table
-entries at coarse levels, where TSNN currently always allocates the full
-table per level.
-
-Reproduce from `examples/image_learn` with `uv run --script benchmark.py`,
-`uv run --script benchmark_tcnn.py [--jit]`, and
-`uv run --script compare.py --markdown [--tcnn-jit bench_tcnn_jit.json]`.
+passes, batch 16,384, RTX 5070 Ti (2026-10-01). Ratios divide tcnn time by
+TSNN time (>1x = TSNN faster). Final PSNR: TSNN 53.24 dB, tcnn JIT 52.84 dB,
+tcnn plain 53.04 dB. Conversion includes matrix conversion and bias copies;
+converted weights are reused for inference.
 
 ## Examples
-For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn), [neural density estimation](examples/nde), and [hierarchical Gaussian mixture](examples/hggrid) examples.
+For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn), [neural density estimation and hierarchical Gaussian mixtures](examples/ndebench) examples.
 
 ## Falcor Usage
 To use this library in Falcor just add it as a [submodule](https://git-scm.com/book/en/v2/Git-Tools-Submodules) and list it in `external/CMakeLists.txt`:

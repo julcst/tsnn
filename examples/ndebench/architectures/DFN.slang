@@ -47,7 +47,7 @@ struct DFNImpl<let K : uint> : IArchitecture
 
     [Differentiable]
     static float[kX] forwardX(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(XNet.forward<Activation>(weights, layout, kXBase, ctx));
+        return CoopVecToArray(XNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, kXBase));
     }
 
     [Differentiable]
@@ -64,7 +64,7 @@ struct DFNImpl<let K : uint> : IArchitecture
             enc[i] = half(encFloats[i]);
 
         let input = ComposeCoopVecPlus<kContextDim, kEncodedDim>(ctx, enc);
-        let params = CoopVecToArray(YNet.forward<Activation>(weights, layout, kYBase, input));
+        let params = CoopVecToArray(YNet.forwardStatic<NDEOffsets, Activation>(weights, input, kYBase));
         return params;
     }
 

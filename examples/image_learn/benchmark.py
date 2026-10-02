@@ -13,6 +13,8 @@ import json
 import math
 from pathlib import Path
 
+from layout import InferenceWeights, compute_layout, static_layouts_source
+
 import numpy as np
 import slangpy as spy
 from tqdm import trange
@@ -45,7 +47,6 @@ HIDDEN_SIZE = 64
 INPUT_SIZE = HASH_LEVELS * HASH_FEATURES  # 32
 OUTPUT_SIZE = 3
 HIDDEN_LAYERS = 4
-TRANSITIONS = HIDDEN_LAYERS + 1
 
 BATCH_SIZE = 1 << 14  # 16 384 pixels per step
 STEPS = 5_000
@@ -67,30 +68,9 @@ def _align4(x: int) -> int:
     return (x + 3) & ~3
 
 
-def layer_input(i):
-    return INPUT_SIZE if i == 0 else HIDDEN_SIZE
+ENC_PARAM_COUNT = HASH_LEVELS * HASH_TABLE_SIZE * HASH_FEATURES
 
-
-def layer_output(i):
-    return OUTPUT_SIZE if i == TRANSITIONS - 1 else HIDDEN_SIZE
-
-
-def param_element_count() -> int:
-    return sum(
-        layer_input(i) * layer_output(i) + layer_output(i) for i in range(TRANSITIONS)
-    )
-
-
-def encoding_param_element_count() -> int:
-    return HASH_LEVELS * HASH_TABLE_SIZE * HASH_FEATURES
-
-
-PARAM_COUNT = param_element_count()
-ENC_PARAM_COUNT = encoding_param_element_count()
-
-PARAM_BYTES = _align4(PARAM_COUNT * 2)  # float16
 ENC_PARAM_BYTES = _align4(ENC_PARAM_COUNT * 2)
-MOMENT_BYTES = PARAM_COUNT * 4  # float32
 ENC_GRAD_BYTES = _align4(ENC_PARAM_COUNT * 4)
 ENC_MOMENT_BYTES = _align4(ENC_PARAM_COUNT * 4)
 
@@ -103,7 +83,7 @@ DISPATCH_THREAD_COUNT = (min(1 << 19, ENC_PARAM_COUNT) + 255) // 256 * 256
 
 
 def create_buffer(device, size_bytes: int, is_rw: bool = False) -> spy.Buffer:
-    usage = spy.BufferUsage.shader_resource
+    usage = spy.BufferUsage.shader_resource | spy.BufferUsage.copy_source
     if is_rw:
         usage |= spy.BufferUsage.unordered_access
     return device.create_buffer(size=size_bytes, usage=usage)
@@ -132,11 +112,24 @@ class ImageLearner:
 
         self.target_tex = upload_texture(device, target)
 
-        self.params = create_buffer(device, PARAM_BYTES, is_rw=True)
-        self.params_master = create_buffer(device, MOMENT_BYTES, is_rw=True)  # float32, same size as moments
-        self.param_grads = create_buffer(device, PARAM_BYTES, is_rw=True)
-        self.moments1 = create_buffer(device, MOMENT_BYTES, is_rw=True)
-        self.moments2 = create_buffer(device, MOMENT_BYTES, is_rw=True)
+        offsets, self.param_count = compute_layout(
+            device, INPUT_SIZE, HIDDEN_SIZE, HIDDEN_LAYERS, OUTPUT_SIZE
+        )
+        self.layout_offsets = offsets
+        param_bytes = self.param_count * 2
+        moment_bytes = self.param_count * 4
+        self.params = create_buffer(device, param_bytes, is_rw=True)
+        self.inference_weights = InferenceWeights(
+            device, self.params, offsets, INPUT_SIZE, HIDDEN_SIZE, HIDDEN_LAYERS, OUTPUT_SIZE
+        )
+        layout_source = static_layouts_source(
+            offsets, self.param_count,
+            self.inference_weights.offsets, self.inference_weights.param_count,
+        )
+        self.params_master = create_buffer(device, moment_bytes, is_rw=True)  # float32, same size as moments
+        self.param_grads = create_buffer(device, param_bytes, is_rw=True)
+        self.moments1 = create_buffer(device, moment_bytes, is_rw=True)
+        self.moments2 = create_buffer(device, moment_bytes, is_rw=True)
         self.enc_params = create_buffer(device, ENC_PARAM_BYTES, is_rw=True)
         self.enc_grads = create_buffer(device, ENC_GRAD_BYTES, is_rw=True)
         self.enc_moments1 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
@@ -144,16 +137,25 @@ class ImageLearner:
         self.output_tex = create_texture(device, self.W, self.H)
 
         self.reset_kernel = device.create_compute_kernel(
-            device.load_program(module_name="Optimize.cs.slang", entry_point_names=["resetMain"])
+            device.load_program(module_name="Optimize.cs.slang", entry_point_names=["resetMain"],
+                additional_source=layout_source)
         )
         self.train_kernel = device.create_compute_kernel(
-            device.load_program(module_name="Train.cs.slang", entry_point_names=["trainMain"])
+            device.load_program(module_name="Train.cs.slang", entry_point_names=["trainMain"],
+                additional_source=layout_source)
         )
         self.optimize_kernel = device.create_compute_kernel(
-            device.load_program(module_name="Optimize.cs.slang", entry_point_names=["optimizeMain"])
+            device.load_program(module_name="Optimize.cs.slang", entry_point_names=["optimizeMain"],
+                additional_source=layout_source)
         )
         self.infer_kernel = device.create_compute_kernel(
-            device.load_program(module_name="Infer.cs.slang", entry_point_names=["inferMain"])
+            device.load_program(module_name="Infer.cs.slang", entry_point_names=["inferMain"],
+                additional_source=layout_source)
+        )
+
+        self.infer_training_kernel = device.create_compute_kernel(
+            device.load_program(module_name="Infer.cs.slang", entry_point_names=["inferTrainingMain"],
+                additional_source=layout_source)
         )
 
         self.reset()
@@ -232,11 +234,23 @@ class ImageLearner:
             command_encoder=encoder,
         )
 
-    def dispatch_infer(self, encoder=None):
-        self.infer_kernel.dispatch(
+    def convert_for_inference(self, encoder=None):
+        owns = encoder is None
+        encoder = encoder or self.device.create_command_encoder()
+        self.inference_weights.convert(encoder)
+        if owns:
+            self.device.submit_command_buffer(encoder.finish())
+
+    def dispatch_infer(self, encoder=None, training_layout=False):
+        kernel = self.infer_training_kernel if training_layout else self.infer_kernel
+        kernel.dispatch(
             thread_count=[self.W, self.H, 1],
             frameDim=[self.W, self.H],
-            vars={"gOutput": self.output_tex, "gParams": self.params, "gEncodingParams": self.enc_params},
+            vars={
+                "gOutput": self.output_tex,
+                "gParams": self.params if training_layout else self.inference_weights.params,
+                "gEncodingParams": self.enc_params,
+            },
             command_encoder=encoder,
         )
 
@@ -244,6 +258,7 @@ class ImageLearner:
         return self.output_tex.to_numpy().view(np.float32)[..., :3]
 
     def infer(self) -> np.ndarray:
+        self.convert_for_inference()
         self.dispatch_infer()
         return self.read_output()
 
@@ -251,40 +266,62 @@ class ImageLearner:
         return float(np.mean((pred - target) ** 2))
 
 
-def run_inference_benchmark(learner: ImageLearner, device, iters: int, warmup: int) -> dict:
-    """Dedicated inference-only GPU throughput for the fused inference kernel,
-    run after training completes: this example trains once then infers from
-    the fixed result, unlike an online setup (e.g. NRC) where training and
-    inference are interleaved every frame -- so inference is benchmarked as
-    its own back-to-back loop, not mixed into the training loop's timing."""
+def time_gpu_operation(device, dispatch, iters: int, warmup: int) -> dict:
+    """Time a GPU operation, including its resource transitions, without readback."""
     for _ in range(warmup):
-        learner.dispatch_infer()
+        encoder = device.create_command_encoder()
+        dispatch(encoder)
+        device.submit_command_buffer(encoder.finish())
     device.wait_for_idle()
-
     query_pool = device.create_query_pool(type=spy.QueryType.timestamp, count=2 * iters)
-    device.wait_for_idle()
-
     encoder = device.create_command_encoder()
     for i in range(iters):
         encoder.write_timestamp(query_pool, 2 * i)
-        learner.dispatch_infer(encoder=encoder)
+        dispatch(encoder)
         encoder.write_timestamp(query_pool, 2 * i + 1)
     device.submit_command_buffer(encoder.finish())
     device.wait_for_idle()
-
     ts = query_pool.get_timestamp_results(0, 2 * iters)
-    gpu_time = sum(ts[2 * i + 1] - ts[2 * i] for i in range(iters))
-
-    pixels = learner.W * learner.H * iters
     return {
         "iters": iters,
-        "gpu_time_s": gpu_time,
-        "mpixels_per_s": pixels / gpu_time / 1e6,
+        "gpu_time_s": sum(ts[2 * i + 1] - ts[2 * i] for i in range(iters)),
+    }
+
+
+def run_inference_benchmark(learner: ImageLearner, device, iters: int, warmup: int,
+                            training_layout=False, convert_each_pass=False) -> dict:
+    """Fixed-weight inference, or conversion plus inference on every pass."""
+    learner.convert_for_inference()
+
+    def dispatch(encoder):
+        if convert_each_pass:
+            learner.convert_for_inference(encoder)
+        learner.dispatch_infer(encoder, training_layout=training_layout)
+
+    result = time_gpu_operation(device, dispatch, iters, warmup)
+    result["mpixels_per_s"] = learner.W * learner.H * iters / result["gpu_time_s"] / 1e6
+    return result
+
+
+def validate_inference_conversion(learner: ImageLearner, target: np.ndarray) -> dict:
+    learner.dispatch_infer(training_layout=True)
+    reference = learner.read_output().copy()
+    converted = learner.infer()
+    if not np.isfinite(reference).all() or not np.isfinite(converted).all():
+        raise RuntimeError("Non-finite output while validating inference conversion")
+    # Reordering a fp16 matrix can change floating-point evaluation order.
+    np.testing.assert_allclose(converted, reference, rtol=1e-3, atol=1e-3)
+    return {
+        "max_abs_error": float(np.max(np.abs(converted - reference))),
+        "mse_between_layouts": learner.mse(converted, reference),
+        "training_layout_psnr": -10 * math.log10(max(learner.mse(reference, target), 1e-10)),
+        "inference_layout_psnr": -10 * math.log10(max(learner.mse(converted, target), 1e-10)),
     }
 
 
 def run(target: np.ndarray, device, steps: int, lr: float, eval_every: int, warmup: int) -> dict:
     learner = ImageLearner(device, target)
+    print(f"MLP storage: {learner.param_count:,} half slots; hash grid: {ENC_PARAM_COUNT:,} parameters")
 
     # Slang pipelines are lazily compiled to native GPU ISA on first dispatch
     # (load_program only gets to SPIRV) -- run a few throwaway steps through
@@ -347,11 +384,22 @@ def run(target: np.ndarray, device, steps: int, lr: float, eval_every: int, warm
         step = block_end + 1
     t.close()
 
+    conversion_validation = validate_inference_conversion(learner, target)
+    inference_training_layout = run_inference_benchmark(
+        learner, device, iters=200, warmup=warmup, training_layout=True
+    )
+    conversion = time_gpu_operation(device, learner.convert_for_inference, 200, warmup)
     inference = run_inference_benchmark(learner, device, iters=200, warmup=warmup)
+    conversion_and_inference = run_inference_benchmark(
+        learner, device, iters=200, warmup=warmup, convert_each_pass=True
+    )
     return {
         "backend": "tsnn",
         "gpu": device.info.adapter_name,
-        "param_count": PARAM_COUNT,
+        "param_count": learner.param_count,
+        "layout_offsets_bytes": learner.layout_offsets.tolist(),
+        "inference_param_count": learner.inference_weights.param_count,
+        "inference_layout_offsets_bytes": learner.inference_weights.offsets.tolist(),
         "enc_param_count": ENC_PARAM_COUNT,
         "config": {
             "hash_levels": HASH_LEVELS,
@@ -362,6 +410,7 @@ def run(target: np.ndarray, device, steps: int, lr: float, eval_every: int, warm
             "hidden_size": HIDDEN_SIZE,
             "hidden_layers": HIDDEN_LAYERS,
             "activation": "LeakyReLU",
+            "inference_layout": "InferencingOptimal",
             "batch_size": BATCH_SIZE,
             "steps": steps,
             "lr": lr,
@@ -372,6 +421,10 @@ def run(target: np.ndarray, device, steps: int, lr: float, eval_every: int, warm
         "optimize_gpu_time_s": optimize_gpu_time,
         "final_psnr": history[-1]["psnr"] if history else None,
         "inference": inference,
+        "inference_training_layout": inference_training_layout,
+        "conversion": conversion,
+        "conversion_and_inference": conversion_and_inference,
+        "conversion_validation": conversion_validation,
     }
 
 
@@ -397,8 +450,6 @@ def main():
         ]
     )
     print(f"GPU: {device.info.adapter_name}")
-    print(f"Parameters: {PARAM_COUNT:,} (MLP) + {ENC_PARAM_COUNT:,} (hash grid)")
-
     result = run(target, device, args.steps, args.lr, args.eval_every, args.warmup)
 
     Path(args.out).write_text(json.dumps(result, indent=2))
@@ -408,6 +459,10 @@ def main():
     inf = result["inference"]
     print(f"[infer]    gpu_time={inf['gpu_time_s']:.3f}s ({inf['iters']} full-image passes, "
           f"{inf['mpixels_per_s']:.1f} Mpixels/s)")
+    for label in ("inference_training_layout", "conversion", "conversion_and_inference"):
+        measurement = result[label]
+        print(f"[{label}] {measurement['gpu_time_s'] / measurement['iters'] * 1e6:.2f} us/pass")
+    print(f"[conversion validation] {result['conversion_validation']}")
     print(f"Result saved -> {args.out}")
 
 

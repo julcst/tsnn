@@ -79,12 +79,12 @@ struct NSFRQS : IArchitecture
         float z1 = x.y - 0.5f;
         float ld = 0.0f;
         {
-            let p = CondMLP.forward<Activation>(weights, layout, kMLP0Base, condInput(ctx, z0));
+            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, z0), kMLP0Base);
             let r = rqsForward<kNumBins>(z1, p, kDomain);
             z1 = r.value; ld += r.logAbsDet;
         }
         {
-            let p = CondMLP.forward<Activation>(weights, layout, kMLP1Base, condInput(ctx, z1));
+            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, z1), kMLP1Base);
             let r = rqsForward<kNumBins>(z0, p, kDomain);
             z0 = r.value; ld += r.logAbsDet;
         }
@@ -97,12 +97,12 @@ struct NSFRQS : IArchitecture
         let z = kPrior.sample(u01);
         float x0 = z.x, x1 = z.y;
         {
-            let p = CondMLP.forward<Activation>(weights, layout, kMLP1Base, condInput(ctx, x1));
+            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, x1), kMLP1Base);
             let r = rqsInverse<kNumBins>(x0, p, kDomain);
             x0 = r.value;
         }
         {
-            let p = CondMLP.forward<Activation>(weights, layout, kMLP0Base, condInput(ctx, x0));
+            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, x0), kMLP0Base);
             let r = rqsInverse<kNumBins>(x1, p, kDomain);
             x1 = r.value;
         }

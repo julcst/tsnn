@@ -179,11 +179,13 @@ def main() -> None:
     r = bm.make_runner(marginal, conditional, width, height, grid, args.batch_size, 4096, ARCHS)
 
     for arch in ARCHS:
+        flat, elements = bm.compute_layout(r.device, bm.MLP_LAYOUTS[arch])
+        source = bm.layout_source(flat, elements)
         r.kernels[f"hero_{arch}"] = r.device.create_compute_kernel(
-            r.device.load_program(module_name="Stages", entry_point_names=[f"hero_{arch}"])
+            r.device.load_program(module_name="Stages", entry_point_names=[f"hero_{arch}"], additional_source=source)
         )
         r.kernels[f"stage1Marginal_{arch}"] = r.device.create_compute_kernel(
-            r.device.load_program(module_name="Stages", entry_point_names=[f"stage1Marginal_{arch}"])
+            r.device.load_program(module_name="Stages", entry_point_names=[f"stage1Marginal_{arch}"], additional_source=source)
         )
 
     query = make_query_grid(RES)

@@ -63,13 +63,13 @@ struct HGGrid : IArchitecture
 
     [Differentiable]
     static float[kNumCells] forwardCoarse(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx) {
-        return CoopVecToArray(CoarseNet.forward<Activation>(weights, layout, kCoarseBase, ctx));
+        return CoopVecToArray(CoarseNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, kCoarseBase));
     }
 
     [Differentiable]
     static float[K * 5] forwardFine(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, no_diff uint2 cell) {
         let input = ComposeCoopVecPlus(ctx, encodeCell(cell));
-        let params = CoopVecToArray(FineNet.forward<Activation>(weights, layout, kFineBase, input));
+        let params = CoopVecToArray(FineNet.forwardStatic<NDEOffsets, Activation>(weights, input, kFineBase));
         // Clip logSigma?
         return params;
     }

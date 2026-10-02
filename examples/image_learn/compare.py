@@ -20,6 +20,19 @@ def load(path):
     return json.loads(open(path).read())
 
 
+def print_conversion_summary(result):
+    if "conversion" not in result:
+        return
+    def us(key):
+        timing = result[key]
+        return timing["gpu_time_s"] / timing["iters"] * 1e6
+    print(f"\nTSNN layout conversion (including bias copies): {us('conversion'):.1f} us/pass; "
+          f"conversion + inference measured together: {us('conversion_and_inference'):.1f} us/pass. "
+          f"TrainingOptimal reference inference: {us('inference_training_layout'):.1f} us/pass.")
+    print(f"Maximum output difference between layouts: "
+          f"{result['conversion_validation']['max_abs_error']:.6g}.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tsnn", default="bench_tsnn.json")
@@ -66,6 +79,7 @@ def main():
               f"batch {a['config']['batch_size']:,}, {a['gpu']}.")
         psnrs = ", ".join(f"{name} {r['final_psnr']:.2f} dB" for name, r, _ in columns)
         print(f"Final PSNR: {psnrs}.")
+        print_conversion_summary(a)
         return
 
     label_width = 20
@@ -88,6 +102,8 @@ def main():
         print(f"{name:{label_width}}{'':{col_width}}{cells}")
     print()
     print(f"{'Final PSNR (dB)':{label_width}}" + "".join(f"{r['final_psnr']:>{col_width}.2f}" for _, r, _ in columns))
+
+    print_conversion_summary(a)
 
 
 if __name__ == "__main__":

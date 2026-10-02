@@ -40,7 +40,7 @@ void resetMain(uint3 tid: SV_DispatchThreadID)
     // and float32 master from the same draw) and tiny-random init for the hash
     // grid; each helper owns its coalesced loop.  Adam moments are zeroed
     // host-side (clear_buffer in main.py).
-    kMLP.initParams<half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount);
+    Net.initParamsStatic<TrainingOffsets, half, float>(gParams, gParamsMaster, tid.x, gDispatchThreadCount);
     initFeatures<half>(gEncodingParams, kEncodingParamElementCount, tid.x, gDispatchThreadCount);
 }
 
@@ -51,7 +51,7 @@ void optimizeMain(uint3 tid: SV_DispatchThreadID)
     adamConfig.invLossScale = 1.0f / gLossScale;
     let adam = Adam(gCurrentStep, adamConfig);
 
-    for (uint base = tid.x * 4u; base < kParamElementCount; base += gDispatchThreadCount * 4u)
+    for (uint base = tid.x * 4u; base < Net.paramCountStatic<TrainingOffsets>(); base += gDispatchThreadCount * 4u)
     {
         var p = LoadFloat4(gParamsMaster, base);
         let g = sanitize(LoadHalf4(gParamGrads, base));

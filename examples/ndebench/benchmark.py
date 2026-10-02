@@ -558,6 +558,21 @@ class Runner:
         }
 
 
+def layout_source(flat, elements):
+    """Export device-queried offsets for an architecture-specific program."""
+    pairs = ", ".join(f"uint2({int(w)}u, {int(b)}u)" for w, b in flat.reshape(-1, 2))
+    return f"""import TSNN.Utils.MLP;
+struct NDEOffsetsImpl : IMLPStaticLayout {{
+    static uint2 offset(uint layer) {{
+        static const uint2 offsets[{len(flat) // 2}] = {{ {pairs} }};
+        return offsets[layer];
+    }}
+    static uint paramCount() {{ return {elements}u; }}
+}}
+export struct NDEOffsets : IMLPStaticLayout = NDEOffsetsImpl;
+"""
+
+
 def make_runner(
     marginal: np.ndarray,
     conditional: np.ndarray,
@@ -576,9 +591,20 @@ def make_runner(
     )
     device = spy.Device(compiler_options=options)
 
-    def load(module: str, entry: str):
+    # Query layouts before linking each architecture's specialized kernels.
+    layout_by_arch: dict[str, object] = {}
+    elements_by_layout: dict[str, int] = {}
+    source_by_arch: dict[str, str] = {}
+    for arch in architectures:
+        flat, elements = compute_layout(device, MLP_LAYOUTS[arch])
+        layout_by_arch[arch] = buffer(device, flat, flat.nbytes, rw=False)
+        elements_by_layout[arch] = elements
+        source_by_arch[arch] = layout_source(flat, elements)
+
+    def load(module: str, entry: str, source=None):
         return device.create_compute_kernel(
-            device.load_program(module_name=module, entry_point_names=[entry])
+            device.load_program(module_name=module, entry_point_names=[entry],
+                                additional_source=source)
         )
 
     kernels = {
@@ -587,17 +613,7 @@ def make_runner(
     }
     for arch in architectures:
         for kind, entry in REGISTRY[arch].items():
-            kernels[entry] = load(MODULE_BY_KIND[kind], entry)
-
-    # Each architecture's per-layer buffer offsets (see compute_layout's doc
-    # comment) are computed host-side, once, from the device's own reported
-    # TrainingOptimal matrix sizes -- Slang has no way to query these itself.
-    layout_by_arch: dict[str, object] = {}
-    elements_by_layout: dict[str, int] = {}
-    for arch in architectures:
-        flat, elements = compute_layout(device, MLP_LAYOUTS[arch])
-        layout_by_arch[arch] = buffer(device, flat, flat.nbytes, rw=False)
-        elements_by_layout[arch] = elements
+            kernels[entry] = load(MODULE_BY_KIND[kind], entry, source_by_arch[arch])
 
     # Each architecture owns its own parameter-element count; buffers are
     # sized to the largest one so every architecture's real weights fit,

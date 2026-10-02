@@ -136,11 +136,11 @@ struct HDFLevels<
         no_diff uint pathX[L], no_diff uint pathY[L], uint level)
     {
         if (level == 0u) {
-            return CoopVecToArray(RootNet.forward<Activation>(weights, layout, levelBase(0u), ctx));
+            return CoopVecToArray(RootNet.forwardStatic<NDEOffsets, Activation>(weights, ctx, levelBase(0u)));
         } else {
             let enc = encodeCell(pathX, pathY, level);
             let input = composeInput(ctx, enc);
-            return CoopVecToArray(RestNet.forward<Activation>(weights, layout, levelBase(level), input));
+            return CoopVecToArray(RestNet.forwardStatic<NDEOffsets, Activation>(weights, input, levelBase(level)));
         }
     }
 

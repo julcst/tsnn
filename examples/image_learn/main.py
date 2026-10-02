@@ -7,6 +7,8 @@ import argparse
 import math
 from pathlib import Path
 import slangpy as spy
+from layout import InferenceWeights, compute_layout, static_layouts_source
+
 import numpy as np
 from tqdm import trange
 
@@ -23,7 +25,6 @@ HIDDEN_SIZE = 64
 INPUT_SIZE = HASH_LEVELS * HASH_FEATURES  # 32
 OUTPUT_SIZE = 3
 HIDDEN_LAYERS = 4
-TRANSITIONS = HIDDEN_LAYERS + 1
 
 # Weight gradients are accumulated via fp16 hardware coopvec atomics
 # (CoopVecComponentType::Float16 in MLP.slang); pre-scaling by LOSS_SCALE
@@ -38,37 +39,16 @@ DISPLAY_EVERY = 200
 RESOLUTION = 512
 
 
-# ─── Parameter-count helper (mirrors MLP.slang::getParamCount) ─────────────
+# ─── Encoding buffer sizes (MLP sizes are queried from the device) ─────────────
 
 
 def _align4(x: int) -> int:
     return (x + 3) & ~3
 
 
-def layer_input(i):
-    return INPUT_SIZE if i == 0 else HIDDEN_SIZE
+ENC_PARAM_COUNT = HASH_LEVELS * HASH_TABLE_SIZE * HASH_FEATURES
 
-
-def layer_output(i):
-    return OUTPUT_SIZE if i == TRANSITIONS - 1 else HIDDEN_SIZE
-
-
-def param_element_count() -> int:
-    return sum(
-        layer_input(i) * layer_output(i) + layer_output(i) for i in range(TRANSITIONS)
-    )
-
-
-def encoding_param_element_count() -> int:
-    return HASH_LEVELS * HASH_TABLE_SIZE * HASH_FEATURES
-
-
-PARAM_COUNT = param_element_count()
-ENC_PARAM_COUNT = encoding_param_element_count()
-
-PARAM_BYTES = _align4(PARAM_COUNT * 2)  # float16
 ENC_PARAM_BYTES = _align4(ENC_PARAM_COUNT * 2)
-MOMENT_BYTES = PARAM_COUNT * 4  # float32
 ENC_GRAD_BYTES = _align4(ENC_PARAM_COUNT * 4)
 ENC_MOMENT_BYTES = _align4(ENC_PARAM_COUNT * 4)
 
@@ -97,7 +77,7 @@ def load_image(path: str, res: int) -> np.ndarray:
 
 
 def create_buffer(device, size_bytes: int, is_rw: bool = False) -> spy.Buffer:
-    usage = spy.BufferUsage.shader_resource
+    usage = spy.BufferUsage.shader_resource | spy.BufferUsage.copy_source
     if is_rw:
         usage |= spy.BufferUsage.unordered_access
     return device.create_buffer(size=size_bytes, usage=usage)
@@ -134,11 +114,24 @@ class ImageLearner:
         self.target_tex = upload_texture(device, target)
 
         # GPU buffers
-        self.params = create_buffer(device, PARAM_BYTES, is_rw=True)
-        self.params_master = create_buffer(device, MOMENT_BYTES, is_rw=True)  # float32, same size as moments
-        self.param_grads = create_buffer(device, PARAM_BYTES, is_rw=True)
-        self.moments1 = create_buffer(device, MOMENT_BYTES, is_rw=True)
-        self.moments2 = create_buffer(device, MOMENT_BYTES, is_rw=True)
+        offsets, self.param_count = compute_layout(
+            device, INPUT_SIZE, HIDDEN_SIZE, HIDDEN_LAYERS, OUTPUT_SIZE
+        )
+        self.layout_offsets = offsets
+        param_bytes = self.param_count * 2
+        moment_bytes = self.param_count * 4
+        self.params = create_buffer(device, param_bytes, is_rw=True)
+        self.inference_weights = InferenceWeights(
+            device, self.params, offsets, INPUT_SIZE, HIDDEN_SIZE, HIDDEN_LAYERS, OUTPUT_SIZE
+        )
+        layout_source = static_layouts_source(
+            offsets, self.param_count,
+            self.inference_weights.offsets, self.inference_weights.param_count,
+        )
+        self.params_master = create_buffer(device, moment_bytes, is_rw=True)  # float32, same size as moments
+        self.param_grads = create_buffer(device, param_bytes, is_rw=True)
+        self.moments1 = create_buffer(device, moment_bytes, is_rw=True)
+        self.moments2 = create_buffer(device, moment_bytes, is_rw=True)
         self.enc_params = create_buffer(device, ENC_PARAM_BYTES, is_rw=True)
         self.enc_grads = create_buffer(device, ENC_GRAD_BYTES, is_rw=True)
         self.enc_moments1 = create_buffer(device, ENC_MOMENT_BYTES, is_rw=True)
@@ -150,24 +143,28 @@ class ImageLearner:
             device.load_program(
                 module_name="Optimize.cs.slang",
                 entry_point_names=["resetMain"],
+                additional_source=layout_source,
             )
         )
         self.train_kernel = device.create_compute_kernel(
             device.load_program(
                 module_name="Train.cs.slang",
                 entry_point_names=["trainMain"],
+                additional_source=layout_source,
             )
         )
         self.optimize_kernel = device.create_compute_kernel(
             device.load_program(
                 module_name="Optimize.cs.slang",
                 entry_point_names=["optimizeMain"],
+                additional_source=layout_source,
             )
         )
         self.infer_kernel = device.create_compute_kernel(
             device.load_program(
                 module_name="Infer.cs.slang",
                 entry_point_names=["inferMain"],
+                additional_source=layout_source,
             )
         )
 
@@ -241,15 +238,19 @@ class ImageLearner:
         )
 
     def infer(self) -> np.ndarray:
+        encoder = self.device.create_command_encoder()
+        self.inference_weights.convert(encoder)
         self.infer_kernel.dispatch(
             thread_count=[self.W, self.H, 1],
             frameDim=[self.W, self.H],
             vars={
                 "gOutput": self.output_tex,
-                "gParams": self.params,
+                "gParams": self.inference_weights.params,
                 "gEncodingParams": self.enc_params,
             },
+            command_encoder=encoder,
         )
+        self.device.submit_command_buffer(encoder.finish())
         return self.output_tex.to_numpy().view(np.float32)[..., :3]
 
     def mse(self, pred: np.ndarray, target: np.ndarray) -> float:
@@ -261,7 +262,7 @@ class ImageLearner:
 
 def train(target: np.ndarray, device, steps: int, lr: float):
     learner = ImageLearner(device, target)
-    print(f"Parameters: {PARAM_COUNT:,} (MLP) + {ENC_PARAM_COUNT:,} (hash grid)")
+    print(f"MLP storage: {learner.param_count:,} half slots; hash grid: {ENC_PARAM_COUNT:,} parameters")
     print(f"Training for {steps} steps, batch size {BATCH_SIZE}")
 
     for step in (t := trange(1, steps + 1)):
@@ -300,7 +301,6 @@ def main():
         ]
     )
     learner = train(target, device, args.steps, args.lr)
-
     pred = learner.infer()
     # Save using slangpy.Bitmap
     bmp = spy.Bitmap(pred, spy.Bitmap.PixelFormat.rgb)
