@@ -1,5 +1,5 @@
 # TSNN
-Deep Learning framework for [Slang](https://github.com/shader-slang/slang), aimed to simplify neural texture compression, neural radiance caching, neural importance sampling, etc., inspired by [tcnn](https://github.com/nvlabs/tiny-cuda-nn) and [RTXNS](https://github.com/NVIDIA-RTX/RTXNS).
+Neural density estimation helpers for [Slang](https://github.com/shader-slang/slang), aimed to simplify neural texture compression, neural radiance caching, neural importance sampling, etc., inspired by [tcnn](https://github.com/nvlabs/tiny-cuda-nn) and [RTXNS](https://github.com/NVIDIA-RTX/RTXNS).
 
 This library only depends on Slang and has explicit support for [Falcor](https://github.com/nvidiagameworks/falcor) and [slangpy](https://github.com/shader-slang/slangpy)
 
@@ -16,7 +16,8 @@ This library only depends on Slang and has explicit support for [Falcor](https:/
 
 ### Modules
 * MLPs
-* Neural Spline Flows
+* Neural Spline Flows (Affine, Linear, Quadratic, RQS, Circular RQS)
+* Neural Mixture Models (Histogram, truncated Gaussian, von Mises-Fisher)
 * Common loss functions (L1/L2, Relative L1/L2, Relative L2 Luminance)
 * Common activation functions (ReLU, Swish, LeakyReLU, etc)
 
@@ -37,6 +38,8 @@ The framework is built around three manually-invoked fully-fused kernel invocati
 The implementation of these kernels is highly problem-specific, so this repo only provides utility functions/classes.
 
 ## Benchmarks
+
+### Image Compression vs tiny-cuda-nn
 [`examples/image_learn`](examples/image_learn) fits a hash-grid + MLP to
 [`examples/einstein.png`](examples/einstein.png) at 512x512 and compares
 against an equivalent [tiny-cuda-nn](https://github.com/nvlabs/tiny-cuda-nn)
