@@ -301,14 +301,52 @@ float erfinv(float x)
 float normalCDFInverse(float p, float mean, float logSigma)
 {
     float k = exp(logSigma) * sqrt(2.0f);
-    // Clamp p away from {0,1}: erfinv's `log2(1 - x^2)` blows up to +inf (x
-    // exactly +-1) or takes a negative argument (NaN, x past +-1 from float32
-    // rounding) once `2p-1` reaches the boundary -- the previously-documented
-    // "TMM sample() occasionally returns inf/out-of-[0,1]" issue (see
-    // FINDING.md). 1e-6 keeps 2p-1 comfortably inside (-1,1) without
-    // perceptibly biasing the sampled quantile.
+    // Keep erfinv's argument strictly inside (-1,1). This general-purpose
+    // linear-CDF inverse cannot recover probabilities lost to tail rounding;
+    // truncated sampling uses sampleTruncatedNormal's log-space path instead.
     let pc = clamp(p, 1.0e-6f, 1.0f - 1.0e-6f);
     return mean + k * erfinv(2.0f * pc - 1.0f);
+}
+
+// Invert log(Phi(z)) without exponentiating a potentially underflowed tail.
+// Reflect upper-half probabilities so Newton always operates at z <= 0.
+float inverseLogNormalCDF(float logP)
+{
+    let reflect = logP > -log(2.0f);
+    let target = reflect ? log1mexp(logP) : logP;
+    float z = -sqrt(-2.0f * target);
+    [ForceUnroll]
+    for (uint i = 0; i < 6u; ++i)
+    {
+        // phi(z)/Phi(z), evaluated without subtracting two large log values.
+        let slope = sqrt(2.0f / float.getPi()) / erfcxPositive(-z / sqrt(2.0f));
+        z -= (logNormalCDFNonPositive(z) - target) / slope;
+    }
+    return reflect ? -z : z;
+}
+
+// Quantile of N(mean, exp(logSigma)^2) conditioned on [0,1]. Interpolate
+// CDFs in log space; reflect right-tail intervals into the left tail first.
+// Both random sampling and deterministic diagnostic paths use this helper.
+float sampleTruncatedNormal(float mean, float logSigma, float u)
+{
+    if (u <= 0.0f) return 0.0f;
+    if (u >= 1.0f) return 1.0f;
+
+    let sigma = exp(logSigma);
+    let invSigma = exp(-logSigma);
+    let a = -mean * invSigma;
+    let b = (1.0f - mean) * invSigma;
+    let reflect = a >= 0.0f;
+    let logA = logNormalCDF(reflect ? -a : a);
+    let logB = logNormalCDF(reflect ? -b : b);
+    let lhs = log1p(-u) + logA;
+    let rhs = log(u) + logB;
+    let maximum = max(lhs, rhs);
+    let logP = maximum + log1p(exp(min(lhs, rhs) - maximum));
+    let z = inverseLogNormalCDF(logP);
+    // Only correct reconstruction roundoff at the interval boundaries.
+    return clamp(fma(sigma, reflect ? -z : z, mean), 0.0f, 1.0f);
 }
 
 // Stable log P(0 <= X <= 1) for X ~ N(mean, sigma^2), sigma = exp(logSigma).

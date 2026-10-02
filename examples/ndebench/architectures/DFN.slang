@@ -88,51 +88,38 @@ struct DFNImpl<let K : uint> : IArchitecture
         return logPDF + log(float(kX)) + log(float(kY));
     }
 
-    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand) {
-        // histX.sample gives a discrete bin, not a continuous ε1 -- the density
-        // is uniform WITHIN each bin (Eq. 4's piecewise-constant p(ε) = v[bin]),
-        // so a real draw needs an independent uniform jitter within the chosen
-        // bin. The bin alone (equivalently: always jittering to exactly 0) would
-        // return only kX*kY fixed grid points, never anything continuous. x must
-        // be jittered BEFORE conditioning forwardY, since Y|X is conditioned on
-        // the continuous ε1, not on which bin it fell in.
-        Histogram<kX> histX;
-        let histXLogits = forwardX(weights, layout, ctx);
-        let binX = histX.sample(histXLogits, rand.nextFloat());
-        let x = (float(binX) + rand.nextFloat()) / float(kX);
-
-        Histogram<kY> histY;
-        let histYLogits = forwardY(weights, layout, ctx, x);
-        let binY = histY.sample(histYLogits, rand.nextFloat());
-        let y = (float(binY) + rand.nextFloat()) / float(kY);
-
-        return float2(x, y);
+    static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand)
+    {
+        // Draw in bin-X, jitter-X, bin-Y, jitter-Y order.
+        let u = float4(rand.nextFloat(), rand.nextFloat(), rand.nextFloat(), rand.nextFloat());
+        float2 prior, afterLayer1;
+        return sampleAt(weights, layout, ctx, u, prior, afterLayer1);
     }
 
-    // Deterministic mirror of sample() for layers_viz's Stages.slang: every
-    // "random" draw sample() would make (bin select, within-bin jitter) is
-    // instead the fixed quantile 0.5 -- the median bin, jittered to its own
-    // center -- so the traced trajectory is a reproducible "typical" sample
-    // instead of one realization of many. Not used by evalLogPDF/sample/
-    // training. prior is the fixed (0.5,0.5): DFN has no continuous prior/
-    // latent concept of its own, only two rounds of (bin draw, jitter).
-    static void sampleTrajectoryFixed(
-        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
-        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    static float2 sampleAt(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, float4 u,
+        out float2 prior, out float2 afterLayer1)
     {
-        prior = float2(0.5f, 0.5f);
-
+        prior = float2(0.5f);
         Histogram<kX> histX;
         let histXLogits = forwardX(weights, layout, ctx);
-        let binX = histX.sample(histXLogits, 0.5f);
-        let x = (float(binX) + 0.5f) / float(kX);
+        let binX = histX.sample(histXLogits, u.x);
+        // Jitter X before conditioning Y on its continuous coordinate.
+        let x = (float(binX) + u.y) / float(kX);
         afterLayer1 = float2(x, prior.y);
 
         Histogram<kY> histY;
         let histYLogits = forwardY(weights, layout, ctx, x);
-        let binY = histY.sample(histYLogits, 0.5f);
-        let y = (float(binY) + 0.5f) / float(kY);
-        outFinal = float2(x, y);
+        let binY = histY.sample(histYLogits, u.z);
+        let y = (float(binY) + u.w) / float(kY);
+        return float2(x, y);
+    }
+
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        outFinal = sampleAt(weights, layout, ctx, float4(0.5f), prior, afterLayer1);
     }
 
     // Exact (no sampling) marginal-over-X probability mass per bin, after

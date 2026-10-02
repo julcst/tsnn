@@ -99,33 +99,12 @@ struct TruncatedGMM<uint N>
 
     Output sample<T : IFloat>(T input[N * STRIDE], inout PCG32 rand)
     {
-        float[N] logWeights;
-        [ForceUnroll]
-        for (uint i = 0; i < N; ++i)
-        {
-            logWeights[i] = input[i * STRIDE].toFloat();
-        }
-        let bin = sampleSoftmax(logWeights, rand.nextFloat());
-
-        // Sample from the selected Gaussian component
-        let offset = bin * STRIDE;
-        let mean = Output(input[offset + 1].toFloat(), input[offset + 2].toFloat());
-        let logSigma = Output(
-            clamp(input[offset + 3].toFloat(), -kLogSigmaMax, kLogSigmaMax),
-            clamp(input[offset + 4].toFloat(), -kLogSigmaMax, kLogSigmaMax));
-
-        // Sample from the truncated Gaussian
-        Output sample;
+        let uComponent = rand.nextFloat();
+        Output uAxis;
         [ForceUnroll]
         for (uint d = 0; d < D; ++d)
-        {
-            let cdfMin = normalCDF(0.0, mean[d], logSigma[d]);
-            let cdfMax = normalCDF(1.0, mean[d], logSigma[d]);
-            let u = cdfMin + rand.nextFloat() * (cdfMax - cdfMin); // Map u to the truncated CDF range
-            sample[d] = normalCDFInverse(u, mean[d], logSigma[d]);
-        }
-
-        return sample;
+            uAxis[d] = rand.nextFloat();
+        return sampleAt(input, uComponent, uAxis);
     }
 
     // Deterministic counterpart of sample(): takes explicit uniform values
@@ -154,10 +133,7 @@ struct TruncatedGMM<uint N>
         [ForceUnroll]
         for (uint d = 0; d < D; ++d)
         {
-            let cdfMin = normalCDF(0.0, mean[d], logSigma[d]);
-            let cdfMax = normalCDF(1.0, mean[d], logSigma[d]);
-            let u = cdfMin + uAxis[d] * (cdfMax - cdfMin);
-            sample[d] = normalCDFInverse(u, mean[d], logSigma[d]);
+            sample[d] = sampleTruncatedNormal(mean[d], logSigma[d], uAxis[d]);
         }
         return sample;
     }

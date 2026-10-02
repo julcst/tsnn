@@ -234,3 +234,18 @@ void adamMain(uint3 tid : SV_DispatchThreadID)
     gMoment1[parameterIndex] = moment1[0];
     gMoment2[parameterIndex] = moment2[0];
 }
+
+[numthreads(64, 1, 1)]
+void sampleAtMain(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= gCount) return;
+    float params[PARAM_COUNT] = {};
+    [ForceUnroll]
+    for (uint j = 0; j < PARAM_COUNT; ++j)
+        params[j] = gParams[j];
+    TruncatedGMM<COMPONENTS> gmm;
+    let x = gmm.sampleAt(params, 0.5f, float2(gInputs[2 * i], gInputs[2 * i + 1]));
+    gOutputs[2 * i] = x.x;
+    gOutputs[2 * i + 1] = x.y;
+}

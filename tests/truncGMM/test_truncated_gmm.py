@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import slangpy as spy
 from scipy.special import ndtr, ndtri, logsumexp
+from scipy.stats import truncnorm
 from tqdm import trange
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,6 +58,7 @@ class Probe:
             "evalMain",
             "halfEvalMain",
             "sampleMain",
+            "sampleAtMain",
             "adamMain",
         ):
             program = self.device.load_program(
@@ -172,6 +174,58 @@ def test_normal_math(probe):
     inv_gpu = probe.cdf(np.stack([p, mean, log_sigma], axis=1))[:, 1]
     inv_ref = mean + np.exp(log_sigma) * ndtri(p)
     assert np.max(np.abs(inv_gpu - inv_ref)) < 4e-4
+
+
+@pytest.mark.parametrize(
+    "mean,log_sigma",
+    [
+        (0.5, -6),
+        (0.5, 6),
+        (0.0, 0),
+        (1.0, 0),
+        (-3.0, -1),
+        (5.0, -1),
+        (20.0, 0),
+        (-20.0, 0),
+        (0.5, -1),
+        (-0.5, -3),
+        (1.5, -3),
+        (-20.0, -6),
+        (20.0, -6),
+        (-20.0, 6),
+        (20.0, 6),
+    ],
+)
+def test_sampling_tail_quantiles(probe, mean, log_sigma):
+    params = initial_params().reshape(COMPONENTS, 5)
+    params[:, 1:3] = mean
+    params[:, 3:5] = log_sigma
+    u = np.array(
+        [0, 1e-5, 0.001, 0.01, 0.1, 0.5, 0.9, 0.99, 0.999, 1 - 1e-5, 1], np.float32
+    )
+    inputs = np.stack([u, 1 - u], axis=1)
+    actual = probe.run("sampleAtMain", inputs, len(u) * 2, params.reshape(-1)).reshape(
+        -1, 2
+    )
+    sigma = np.exp(log_sigma)
+    expected = truncnorm.ppf(
+        inputs.astype(np.float64),
+        -mean / sigma,
+        (1 - mean) / sigma,
+        loc=mean,
+        scale=sigma,
+    )
+    assert np.all(np.isfinite(actual))
+    assert np.all((actual >= 0) & (actual <= 1))
+    np.testing.assert_allclose(actual, expected, atol=2e-4, rtol=0)
+    samples = probe.sample(16384, params.reshape(-1))
+    assert np.all(np.isfinite(samples))
+    assert np.all((samples >= 0) & (samples <= 1))
+    empirical = np.quantile(samples[:, 0], [0.1, 0.5, 0.9])
+    reference = truncnorm.ppf(
+        [0.1, 0.5, 0.9], -mean / sigma, (1 - mean) / sigma, loc=mean, scale=sigma
+    )
+    np.testing.assert_allclose(empirical, reference, atol=0.015, rtol=0)
 
 
 def test_warm_throughput(probe):

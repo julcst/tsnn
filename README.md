@@ -96,9 +96,9 @@ throughput and inverse χ² on the axes, so top right is best; colors and diagon
 guides show expected variance after 1 ms, `χ² / (throughput × 0.001 s)`.
 
 DF-N is the fastest sampler in this run. HGGrid `G4 L2 H16 D3 K8` combines
-6.24 billion samples/s with χ² 0.0315; NSF-RQS has the lowest χ², 0.0300.
-TMM produces non-finite importance ratios for 9.98% of model samples and is
-marked with an asterisk and excluded from the sampling Pareto frontier.
+5.44 billion samples/s with χ² 0.0307; NSF-RQS has the lowest χ², 0.0295.
+All nine models produce finite importance ratios for every diagnostic sample.
+TMM uses log-space truncated-normal sampling and is on the sampling Pareto frontier.
 These measurements describe this image, budget, seed and device.
 
 See the [numeric results](examples/ndebench/figures/summary.md),

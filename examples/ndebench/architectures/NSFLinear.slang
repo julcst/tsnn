@@ -112,33 +112,17 @@ struct NSFLinear : IArchitecture
 
     static float2 sample(MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, inout PCG32 rand)
     {
-        float2 u01 = float2(rand.nextFloat(), rand.nextFloat());
-        let z = kPrior.sample(u01);
-        float x0 = z.x, x1 = z.y;
-        {
-            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, x1), kMLP1Base);
-            let r = plInverse<kNumBins>(x0, p, kDomain);
-            x0 = r.value;
-        }
-        {
-            let p = CondMLP.forwardStatic<NDEOffsets, Activation>(weights, condInput(ctx, x0), kMLP0Base);
-            let r = plInverse<kNumBins>(x1, p, kDomain);
-            x1 = r.value;
-        }
-        return float2(x0, x1) + 0.5f;
+        let u01 = float2(rand.nextFloat(), rand.nextFloat());
+        float2 prior, afterLayer1;
+        return sampleAt(weights, layout, ctx, u01, prior, afterLayer1);
     }
 
-    // Deterministic mirror of sample() for layers_viz's Stages.slang: the
-    // fixed prior latent (0.5,0.5) (i.e. z=(0,0), the exact center of the
-    // uniform box) run through the same two coupling steps sample() uses --
-    // no randomness needed at all beyond the fixed prior, since plInverse is
-    // a deterministic bijection given z. Not used by evalLogPDF/sample/
-    // training.
-    static void sampleTrajectoryFixed(
-        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
-        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    // Shared inverse coupling path for random samples and diagnostic quantiles.
+    static float2 sampleAt(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx, float2 u01,
+        out float2 prior, out float2 afterLayer1)
     {
-        let z = kPrior.sample(float2(0.5f, 0.5f));
+        let z = kPrior.sample(u01);
         float x0 = z.x, x1 = z.y;
         prior = float2(x0, x1) + 0.5f;
         {
@@ -152,7 +136,14 @@ struct NSFLinear : IArchitecture
             let r = plInverse<kNumBins>(x1, p, kDomain);
             x1 = r.value;
         }
-        outFinal = float2(x0, x1) + 0.5f;
+        return float2(x0, x1) + 0.5f;
+    }
+
+    static void sampleTrajectoryFixed(
+        MatrixBiasBuffer weights, no_diff Layout layout, Context ctx,
+        out float2 prior, out float2 afterLayer1, out float2 outFinal)
+    {
+        outFinal = sampleAt(weights, layout, ctx, float2(0.5f), prior, afterLayer1);
     }
 
     // Exact (no sampling, no integration) layer-1-only log-density at a query
