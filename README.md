@@ -62,7 +62,7 @@ frame):
 | Training (fwd+bwd) | 488.6 us/step | 520.0 us/step | 646.5 us/step | 1.06x | 1.32x |
 | Optimizer step | 504.0 us/step | 551.1 us/step | 549.9 us/step | 1.09x | 1.09x |
 | Layout conversion | 8.5 us/pass | — | — | — | — |
-| Inference (converted weights) | 81.7 us/pass | 115.7 us/pass | 197.4 us/pass | 1.42x | 2.42x |
+| Inference | 81.7 us/pass | 115.7 us/pass | 197.4 us/pass | 1.42x | 2.42x |
 
 Averaged over 5,000 training steps and 200 full-image (512x512) inference
 passes, batch 16,384, RTX 5070 Ti (2026-10-01). Ratios divide tcnn time by
