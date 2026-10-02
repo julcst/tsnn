@@ -106,6 +106,9 @@ See the [numeric results](examples/ndebench/figures/summary.md),
 [configuration and reproduction notes](examples/ndebench/README.md).
 Run `cd examples/ndebench && uv run benchmark.py` to reproduce the figures.
 
+> [!NOTE]  
+> HGGrid and HDF were developed as part of my master’s lab project; the other models are reimplementations of prior work
+
 ## Examples
 For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn), [neural density estimation and hierarchical Gaussian mixtures](examples/ndebench) examples.
 
@@ -116,3 +119,20 @@ To use this library in Falcor just add it as a [submodule](https://git-scm.com/b
 add_subdirectory(tsnn)
 ```
 The shader library will be added automatically.
+
+## License and Citation
+
+This framework is licensed under the BSD 3-clause license.
+Please see LICENSE.txt for details.
+
+If you use it in your research, we would appreciate a citation via
+
+```bibtex
+@software{tsnn,
+	author = {Stamm, Julian},
+	license = {BSD-3-Clause},
+	title = {{tsnn}},
+	url = {https://github.com/julcst/tsnn},
+	year = {2026}
+}
+```

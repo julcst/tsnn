@@ -1,5 +1,7 @@
 
-
+// Translation of Norbert Juffa's BSD-2-Clause erff approximation.
+// Maximum error reported for the original CUDA implementation: 1.29532 ULP.
+//
 // SPDX-License-Identifier: BSD-2-Clause
 //
 // Slang/SPIR-V translation of Norbert Juffa's CUDA erff approximation.
@@ -31,8 +33,6 @@
 // THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-// Based on Norbert Juffa's BSD-2-Clause erff approximation.
-// Maximum error reported for the original CUDA implementation: 1.29532 ULP.
 [ForceInline]
 [BackwardDerivative(erf_bwd)]
 float erf(float x)
@@ -101,6 +101,38 @@ void erf_bwd(inout DifferentialPair<float> dpx, float dOut)
 // is dropped per Juffa's note that it roughly doubles the cost -- every call
 // site here reflects into the nonnegative half first.
 // Maximum error reported for the original CUDA nonnegative-input path: 1.97521 ULP.
+// Original license:
+// SPDX-License-Identifier: BSD-2-Clause
+//
+// Slang/SPIR-V translation of Norbert Juffa's CUDA erff approximation.
+// The translation changes target-language intrinsics but retains the
+// original approximation and coefficients.
+//
+// Copyright (c) 2016-2021, Norbert Juffa
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 [ForceInline]
 [BackwardDerivative(erfcxPositive_bwd)]
 float erfcxPositive(float a)
