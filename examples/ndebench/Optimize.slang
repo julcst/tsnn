@@ -4,17 +4,7 @@ import TSNN.Utils.MLP;
 import TSNN.Encodings.FeatureBuffer;
 
 import architectures.IArchitecture;
-import architectures.TMM;
-import architectures.HGGrid;
-import architectures.DFN;
-import architectures.DFL;
-import architectures.NSFLinear;
-import architectures.NSFQuadratic;
-import architectures.NSFRQS;
-import architectures.HDF;
-import architectures.HDFLevels;
-import architectures.HGGridLevels;
-import architectures.HGGridGMM;
+#include "Configurations.slangh"
 
 /// float16 gradients written by train, read-only
 StructuredBuffer<half4> gParamGrads;
@@ -50,19 +40,8 @@ cbuffer CB
     uint gDispatchThreadCount;
 }
 
-// A compute kernel entry point with exactly one scalar `uniform` parameter
-// (as opposed to a field inside a named cbuffer) reproducibly corrupts this
-// environment's Vulkan device: the dispatch *following* it hangs the GPU and
-// takes the device down as Xid 109 (CTX SWITCH TIMEOUT), regardless of which
-// kernel or buffers that next dispatch touches. Verified in isolation with a
-// standalone shader with no TSNN/ndebench code at all -- this is a
-// SlangPy/slang-rhi/driver push-constant-layout bug on this GPU/driver, not
-// an application bug. hggrid/image_learn's reset kernels never hit this
-// because they already route their dispatch-thread-count through a cbuffer
-// (see examples/hggrid/Optimize.cs.slang's `CB.gDispatchThreadCount`); this
-// one used a lone `uniform uint threadCount` instead, which is what init_TMM
-// used to declare here. `InitCB` below is the fix: it makes the payload a
-// named-cbuffer field like every other kernel in this file already uses.
+// Keep scalar dispatch arguments in named cbuffers. A lone scalar `uniform`
+// entry-point argument hangs the following Vulkan dispatch on this driver.
 cbuffer InitCB
 {
     uint gInitThreadCount;
@@ -83,36 +62,6 @@ void init<T : IArchitecture>(uint3 tid : SV_DispatchThreadID)
         init<ARCHITECTURE>(tid); \
     }
 
-NDEBENCH_RESET_KERNEL(TMM)
-NDEBENCH_RESET_KERNEL(HGGrid)
-NDEBENCH_RESET_KERNEL(DFN)
-NDEBENCH_RESET_KERNEL(DFL)
-NDEBENCH_RESET_KERNEL(DFN16)
-NDEBENCH_RESET_KERNEL(DFL16)
-NDEBENCH_RESET_KERNEL(NSFLinear)
-NDEBENCH_RESET_KERNEL(NSFQuadratic)
-NDEBENCH_RESET_KERNEL(NSFRQS)
-NDEBENCH_RESET_KERNEL(HDF)
-NDEBENCH_RESET_KERNEL(HDFG4L3)
-NDEBENCH_RESET_KERNEL(HDFG3L4)
-NDEBENCH_RESET_KERNEL(HDFG4L3B)
-NDEBENCH_RESET_KERNEL(HDFG3L4B)
-NDEBENCH_RESET_KERNEL(HDFG4L3S)
-NDEBENCH_RESET_KERNEL(HGGridG2L3)
-NDEBENCH_RESET_KERNEL(HGGridG2L3B)
-NDEBENCH_RESET_KERNEL(HGGridG4L2)
-NDEBENCH_RESET_KERNEL(HGGridG4L2B)
-NDEBENCH_RESET_KERNEL(HGGridG4L2S)
-NDEBENCH_RESET_KERNEL(HDFFastest)
-NDEBENCH_RESET_KERNEL(HDFFast)
-NDEBENCH_RESET_KERNEL(HGGridFastest)
-NDEBENCH_RESET_KERNEL(HGGridFast)
-NDEBENCH_RESET_KERNEL(HGGridGMM16)
-NDEBENCH_RESET_KERNEL(HGGridGMM16Fast)
-NDEBENCH_RESET_KERNEL(HGGridGMM16KC24)
-NDEBENCH_RESET_KERNEL(HGGridFastK12)
-NDEBENCH_RESET_KERNEL(HGGridFastK16)
-NDEBENCH_RESET_KERNEL(HGGridG4L3)
 
 [numthreads(256, 1, 1)]
 void optimize(uint3 tid: SV_DispatchThreadID)
@@ -147,3 +96,9 @@ void optimize(uint3 tid: SV_DispatchThreadID)
     dbg.flush(gDebugCounters);
 #endif
 }
+
+#define NDEBENCH_MODEL(NAME) NDEBENCH_RESET_KERNEL(NAME)
+#define NDEBENCH_GRID(NAME, G, L, H, D, K) NDEBENCH_MODEL(NAME)
+#include "Models.slangh"
+#undef NDEBENCH_GRID
+#undef NDEBENCH_MODEL

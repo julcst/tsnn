@@ -1,0 +1,14 @@
+// The benchmark's configuration list. Included with caller-defined macros.
+// Grid arguments: name, grid width G, histogram levels L, MLP width H,
+// hidden-layer count D, Gaussian count K (0 = HDF).
+NDEBENCH_MODEL(TMM)
+NDEBENCH_MODEL(DFN16)
+NDEBENCH_MODEL(DFL16)
+NDEBENCH_MODEL(NSFLinear)
+NDEBENCH_MODEL(NSFQuadratic)
+NDEBENCH_MODEL(NSFRQS)
+// Narrow cascade: lower per-update cost at the same 64×64 leaf resolution.
+NDEBENCH_GRID(HDF_G4L3_H32D2, 4, 3, 32, 2, 0)
+NDEBENCH_GRID(HDF_G8L2_H32D2, 8, 2, 32, 2, 0)
+// K=12/16 and deeper grids did not improve the speed/variance tradeoff.
+NDEBENCH_GRID(HGGrid_G4L2_H16D3_K8, 4, 2, 16, 3, 8)

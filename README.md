@@ -70,6 +70,42 @@ TSNN time (>1x = TSNN faster). Final PSNR: TSNN 53.24 dB, tcnn JIT 52.84 dB,
 tcnn plain 53.04 dB. Conversion includes matrix conversion and bias copies;
 converted weights are reused for inference.
 
+### Neural Density Estimation
+
+[`examples/ndebench`](examples/ndebench) fits the luminance distribution of
+Einstein with factorized densities, spline flows, and hierarchical histograms.
+HDF and HGGrid share one implementation: `K=0` gives uniform histogram leaves,
+while `K>0` adds a truncated Gaussian mixture within each leaf. Configuration
+labels give grid width `G`, histogram levels `L`, MLP width `H`, hidden layers
+`D`, and Gaussian count `K`; `B` is the per-axis bin count.
+
+![Learned density comparison](examples/ndebench/figures/images.png)
+
+![Density-estimation convergence](examples/ndebench/figures/convergence.png)
+
+![Sampling throughput, inverse Pearson chi-squared and equal-time variance](examples/ndebench/figures/pareto.png)
+
+Measured on an RTX 5070 Ti using Vulkan and SlangPy 0.42.0 (2026-10-02),
+seed 42, native-resolution 3250×3259 target, batch 262,144, Adam learning rate
+0.001, and five GPU seconds of training per method. Compilation, warmup and
+checkpoint evaluation are excluded; inference averages 100 warmed dispatches
+of 262,144 queries. All density panels share the same linear color scale.
+KL and Pearson χ² use texel-center quadrature; lower χ² means lower theoretical
+importance-sampling variance for the fitted PDF. The sampling plot puts
+throughput and inverse χ² on the axes, so top right is best; colors and diagonal
+guides show expected variance after 1 ms, `χ² / (throughput × 0.001 s)`.
+
+DF-N is the fastest sampler in this run. HGGrid `G4 L2 H16 D3 K8` combines
+6.24 billion samples/s with χ² 0.0315; NSF-RQS has the lowest χ², 0.0300.
+TMM produces non-finite importance ratios for 9.98% of model samples and is
+marked with an asterisk and excluded from the sampling Pareto frontier.
+These measurements describe this image, budget, seed and device.
+
+See the [numeric results](examples/ndebench/figures/summary.md),
+[recorded run](examples/ndebench/figures/results.json), and
+[configuration and reproduction notes](examples/ndebench/README.md).
+Run `cd examples/ndebench && uv run benchmark.py` to reproduce the figures.
+
 ## Examples
 For examples using [slangpy](https://github.com/shader-slang/slangpy) see the [texture compression](examples/image_learn), [neural density estimation and hierarchical Gaussian mixtures](examples/ndebench) examples.
 

@@ -1,0 +1,14 @@
+#pragma once
+import architectures.TMM;
+import architectures.DFN;
+import architectures.DFL;
+import architectures.NSFLinear;
+import architectures.NSFQuadratic;
+import architectures.NSFRQS;
+import architectures.HGGrid;
+
+#define NDEBENCH_MODEL(NAME)
+#define NDEBENCH_GRID(NAME, G, L, H, D, K) typealias NAME = HGGrid<G, L, H, K, D>;
+#include "Models.slangh"
+#undef NDEBENCH_GRID
+#undef NDEBENCH_MODEL

@@ -1,31 +1,5 @@
 #!/usr/bin/env python3
-"""
-Visualize intermediate sampling steps for NSF-Linear, DFN16, HDF and HGGrid,
-using the *real* SlangPy-trained networks on examples/einstein.png (not an
-offline numpy/EM approximation) -- see Stages.slang and each architecture's
-own sampleTrajectoryFixed()/stage1MarginalX()/stage1MarginalCoarse()/
-stage1LogDensityX0() instrumentation methods, added alongside their real
-sample()/evalLogPDF without changing either.
-
-For each architecture: train to convergence via the same NLL loop
-benchmark.py uses (image-sampled data, trainNLL + Adam), then evaluate,
-with NO random sampling anywhere in this script:
-  - stage 2 (final) density: the exact evalLogPDF grid, via the existing
-    inferEval_<Arch> kernel (same one benchmark.py itself uses).
-  - stage 1 (after layer 1) density: also exact. DFN16/HDF/HGGrid's first
-    layer doesn't depend on any continuous input (IArchitecture's ctx is a
-    trivial constant), so it's a direct softmax read-back of a handful of
-    numbers, not a histogram of samples. NSF-Linear's first layer does
-    depend on a continuous (still-latent) z1, so it's evaluated at the same
-    fixed z1=0 its own hero sample uses -- i.e. just that one coupling
-    step's log-det, exponentiated; layer 2 isn't applied at all.
-  - one deterministic "hero" sample trajectory (prior / after layer 1 /
-    final) per architecture: every random draw sample() would make is fixed
-    at the median quantile 0.5 instead, so the traced point is a
-    reproducible "typical" sample rather than one lucky/unlucky realization.
-
-Run with: uv run plot_real_layers.py [--seconds-per-arch S]
-"""
+"""Plot exact intermediate densities and median sample paths from trained networks."""
 
 from __future__ import annotations
 
@@ -40,18 +14,18 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 import benchmark as bm  # noqa: E402  (reuse its Runner/make_runner/image helpers)
+from models import GRID_CONFIGS  # noqa: E402
 
-ARCHS = ["NSFLinear", "DFN16", "HDF", "HGGrid"]
+ARCHS = ["NSFLinear", "DFN16", "HDF_G8L2_H32D2", "HGGrid_G4L2_H16D3_K8"]
 LABELS = {
     "NSFLinear": "NSF-Linear  (K=16 coupling flow)",
     "DFN16": "DFN16  (factorization, nearest-neighbor)",
-    "HDF": "HDF  (8x8 coarse hist -> 8x8 fine hist)",
-    "HGGrid": "HGGrid  (8x8 coarse hist -> K=4 GMM)",
+    "HDF_G8L2_H32D2": "HDF (G8 L2 H32 D2)",
+    "HGGrid_G4L2_H16D3_K8": "HGGrid (G4 L2 H16 D3 K8)",
 }
-RES = 220          # heatmap grid resolution
-SEED = 42          # training data (image sampling) seed only -- nothing plotted is randomly sampled
+RES = 220  # heatmap grid resolution
+SEED = 42  # training data (image sampling) seed only -- nothing plotted is randomly sampled
 K_DFN16 = 16
-G_COARSE = 8
 
 
 def make_query_grid(res: int) -> np.ndarray:
@@ -75,7 +49,12 @@ def train_equal_time(r: bm.Runner, arch: str, seconds: float, group_size: int, s
 def eval_density(r: bm.Runner, arch: str, query: spy.Buffer, out: spy.Buffer, n: int) -> np.ndarray:
     r.kernels[bm.REGISTRY[arch]["eval"]].dispatch(
         thread_count=[n, 1, 1],
-        vars={"gParams": r.params, "gSamples": query, "gLogPDFs": out, "gLayout": r.layout_by_arch[arch]},
+        vars={
+            "gParams": r.params,
+            "gSamples": query,
+            "gLogPDFs": out,
+            "gLayout": r.layout_by_arch[arch],
+        },
     )
     r.device.wait()
     return np.exp(np.frombuffer(out.to_numpy(), dtype=np.float32).copy())
@@ -98,7 +77,10 @@ def hero_sample(r: bm.Runner, arch: str) -> tuple[np.ndarray, np.ndarray, np.nda
         },
     )
     r.device.wait()
-    to2 = lambda b: np.frombuffer(b.to_numpy(), dtype=np.float32).reshape(2)
+
+    def to2(b):
+        return np.frombuffer(b.to_numpy(), dtype=np.float32).reshape(2)
+
     return to2(prior_buf), to2(after1_buf), to2(final_buf)
 
 
@@ -110,7 +92,11 @@ def stage1_density(r: bm.Runner, arch: str, marginal_buf: spy.Buffer, res: int) 
     if arch == "DFN16":
         r.kernels["stage1Marginal_DFN16"].dispatch(
             thread_count=[K_DFN16, 1, 1],
-            vars={"gParams": r.params, "gStage1Marginal": marginal_buf, "gLayout": r.layout_by_arch[arch]},
+            vars={
+                "gParams": r.params,
+                "gStage1Marginal": marginal_buf,
+                "gLayout": r.layout_by_arch[arch],
+            },
         )
         r.device.wait()
         probs = np.frombuffer(marginal_buf.to_numpy(), dtype=np.float32)[:K_DFN16].copy()
@@ -118,17 +104,22 @@ def stage1_density(r: bm.Runner, arch: str, marginal_buf: spy.Buffer, res: int) 
         density_1d = probs[col_bin] * K_DFN16
         return np.tile(density_1d[None, :], (res, 1))
 
-    if arch in ("HDF", "HGGrid"):
+    if arch in ("HDF_G8L2_H32D2", "HGGrid_G4L2_H16D3_K8"):
+        g = GRID_CONFIGS[arch][0]
         r.kernels[f"stage1Marginal_{arch}"].dispatch(
-            thread_count=[G_COARSE * G_COARSE, 1, 1],
-            vars={"gParams": r.params, "gStage1Marginal": marginal_buf, "gLayout": r.layout_by_arch[arch]},
+            thread_count=[g * g, 1, 1],
+            vars={
+                "gParams": r.params,
+                "gStage1Marginal": marginal_buf,
+                "gLayout": r.layout_by_arch[arch],
+            },
         )
         r.device.wait()
-        probs = np.frombuffer(marginal_buf.to_numpy(), dtype=np.float32)[: G_COARSE * G_COARSE].copy()
-        probs2d = probs.reshape(G_COARSE, G_COARSE)  # [cx, cy], matching architectures' grid2bin(cell)=cx*dim+cy
-        idx = np.clip((query_x * G_COARSE).astype(int), 0, G_COARSE - 1)  # same binning on both axes
+        probs = np.frombuffer(marginal_buf.to_numpy(), dtype=np.float32)[: g * g].copy()
+        probs2d = probs.reshape(g, g)  # [cx, cy], matching architectures' grid2bin(cell)=cx*dim+cy
+        idx = np.clip((query_x * g).astype(int), 0, g - 1)  # same binning on both axes
         # dens[row, col] = probs2d[idx[col], idx[row]] * 64 (row ~ y, col ~ x)
-        return probs2d[idx][:, idx].T * (G_COARSE * G_COARSE)
+        return probs2d[idx][:, idx].T * (g * g)
 
     # NSFLinear: invert layer 1 (conditioned on the hero trajectory's fixed
     # z1=0), then log-prior + logAbsDet per query column -- no sampling or
@@ -153,7 +144,15 @@ def save_frame_pdf(dens: np.ndarray, pt: np.ndarray, vmax: float, path: Path) ->
     ticks, title, or border -- for dropping straight into a figure/slide."""
     fig = plt.figure(figsize=(4, 4))
     ax = fig.add_axes([0, 0, 1, 1])
-    ax.imshow(dens, extent=(0, 1, 0, 1), origin="lower", cmap="magma", vmin=0, vmax=vmax, interpolation="nearest")
+    ax.imshow(
+        dens,
+        extent=(0, 1, 0, 1),
+        origin="lower",
+        cmap="magma",
+        vmin=0,
+        vmax=vmax,
+        interpolation="nearest",
+    )
     ax.scatter([pt[0]], [pt[1]], c="cyan", s=140, edgecolors="white", linewidths=1.5, zorder=3)
     ax.set_xlim(0, 1)
     ax.set_ylim(1, 0)  # row 0 = top of image, matches load_image/eval convention
@@ -168,7 +167,9 @@ def main() -> None:
     p.add_argument("--image", type=Path, default=bm.ROOT / "examples/einstein.png")
     p.add_argument("--seconds-per-arch", type=float, default=6.0)
     p.add_argument("--batch-size", type=int, default=1 << 16)
-    p.add_argument("--output", type=Path, default=Path(__file__).parent / "output" / "nde_layers_real.png")
+    p.add_argument(
+        "--output", type=Path, default=Path(__file__).parent / "output" / "nde_layers_real.png"
+    )
     args = p.parse_args()
 
     masses, width, height = bm.load_image(args.image)
@@ -182,10 +183,16 @@ def main() -> None:
         flat, elements = bm.compute_layout(r.device, bm.MLP_LAYOUTS[arch])
         source = bm.layout_source(flat, elements)
         r.kernels[f"hero_{arch}"] = r.device.create_compute_kernel(
-            r.device.load_program(module_name="Stages", entry_point_names=[f"hero_{arch}"], additional_source=source)
+            r.device.load_program(
+                module_name="Stages", entry_point_names=[f"hero_{arch}"], additional_source=source
+            )
         )
         r.kernels[f"stage1Marginal_{arch}"] = r.device.create_compute_kernel(
-            r.device.load_program(module_name="Stages", entry_point_names=[f"stage1Marginal_{arch}"], additional_source=source)
+            r.device.load_program(
+                module_name="Stages",
+                entry_point_names=[f"stage1Marginal_{arch}"],
+                additional_source=source,
+            )
         )
 
     query = make_query_grid(RES)
@@ -210,7 +217,7 @@ def main() -> None:
         )
 
     fig, axes = plt.subplots(len(ARCHS), 3, figsize=(11, 15), constrained_layout=True)
-    col_titles = ["Prior + 1 sample", "After layer 1", "After layer 2 (final)"]
+    col_titles = ["Prior + 1 sample", "After layer 1", "Final density"]
     stage_keys = ["prior", "layer1", "final"]
     frames_dir = args.output.parent / "frames"
 
@@ -233,10 +240,17 @@ def main() -> None:
             # bins) -- the default interpolation blurs bin boundaries into a
             # false-looking gradient when upsampling this array for display.
             ax.imshow(
-                dens, extent=(0, 1, 0, 1), origin="lower", cmap="magma", vmin=0, vmax=vmax,
+                dens,
+                extent=(0, 1, 0, 1),
+                origin="lower",
+                cmap="magma",
+                vmin=0,
+                vmax=vmax,
                 interpolation="nearest",
             )
-            ax.scatter([pt[0]], [pt[1]], c="cyan", s=90, edgecolors="white", linewidths=1.2, zorder=3)
+            ax.scatter(
+                [pt[0]], [pt[1]], c="cyan", s=90, edgecolors="white", linewidths=1.2, zorder=3
+            )
             ax.set_xlim(0, 1)
             ax.set_ylim(1, 0)  # row 0 = top of image, matches load_image/eval convention
             ax.set_xticks([])

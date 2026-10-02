@@ -1,597 +1,274 @@
 #!/usr/bin/env -S uv run --script
-"""Plot artifacts written by benchmark.py; this script never opens a GPU.
-
-Produces four separate PDFs (styled after lab-neural-importance-sampling/figures'
-ndebench_convergence.py / ndebench_maps.py -- colorblind-safe qualitative palette,
-log-log grid with sub-decade ticks, frameless legends) rather than one dense PNG:
-
-- convergence.pdf -- KL(target || model) vs. training GPU time, one line per focus arch.
-- pareto.pdf       -- ALL architectures, sampling throughput vs. importance-sampling ratio
-                       variance (log-log, so a line of constant eq-time achieved variance is
-                       a straight diagonal -- see `plot_pareto`), bubble size = params, with
-                       the speed/variance Pareto frontier traced and labeled.
-- images.pdf       -- learned-density thumbnails, reference + focus archs only.
-- table.pdf        -- the focus archs' numeric comparison, as its own figure.
-
-"Focus" (what convergence.pdf/images.pdf/table.pdf show) is the pareto plot's own
-Pareto-optimal set on sampling speed vs. IS-ratio variance (see `pareto_frontier`) plus a
-short, hand-picked ALWAYS_SHOW list of architectures worth seeing even though they're
-dominated (NSF-Q's training instability, DF-N/DF-L as NSF's explicit-density
-counterparts) -- so the frontier itself stays fully data-driven while still not
-silently dropping the handful of architectures whose story isn't "did it win."
-"""
+"""CPU-only figures from a benchmark run: PNGs for README, PDFs for print."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import textwrap
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+from PIL import Image
+
+from models import ARCHITECTURES, LABELS
 
 HERE = Path(__file__).resolve().parent
-plt.rcParams.update({"font.size": 13, "axes.labelsize": 14, "xtick.labelsize": 12, "ytick.labelsize": 12, "legend.fontsize": 12})
-KL_FLOOR = 1e-4
-
-# Display names, mirroring lab-neural-importance-sampling/figures/ndebench_data.py's
-# LABELS (kept independent, not imported, since this script must run standalone without
-# the lab checkout -- see the module docstring's "never opens a GPU"/self-contained goal).
-#
-# The HDF*/HGGrid* variants spell out their actual cascade geometry (matching benchmark.py's
-# hdf_levels_layout(G, L, ...)/hggrid_levels_layout(G, L, ..., K, ...) calls: L levels of a
-# GxG grid, "NG" = HGGrid's final N-Gaussian continuous head) instead of the bare "Fast"/
-# "Fastest" qualifiers -- those named a speed ranking, not what configuration produced it.
-# "(d2)" marks the two variants that share their baseline's exact grid geometry but use a
-# 2-layer MLP instead of the baseline's 3 (see FINDING.md's HDF/HGGrid optimal-config entry).
-# Suffixes: "B" = spline/histogram bins per coupling, "G" = Gaussians in the mixture, "N×N" =
-# effective 2D histogram resolution.
-LABELS = {
-    "TMM": "TMM (16G)",
-    "DFN": "DF-N (32×32)",
-    "DFL": "DF-L (32×32)",
-    "NSFLinear": "NSF-L (16B)",
-    "NSFQuadratic": "NSF-Q (16B)",
-    "NSFRQS": "NSF-RQS (16B)",
-    "HDF": "HDF 8×8→8×8 (64×64)",
-    "HGGrid": "HGGrid 8×8→4G (8×8, 4G)",
-    "HDFFast": "HDF 8×8→8×8 (d2, 64×64)",
-    "HDFFastest": "HDF 4×4→4×4→4×4 (64×64)",
-    "HGGridFast": "HGGrid 4×4→4×4→8G (16×16, 8G)",
-    "HGGridFastest": "HGGrid 8×8→4G (d2, 8×8, 4G)",
-    "DFN16": "DF-N (16×16)",
-    "DFL16": "DF-L (16×16)",
-}
-
-# Colorblind-safe (Okabe-Ito) colors for the figures' focus set (Pareto frontier plus the
-# always-shown architectures below), extended with a few standard tab10 hues past Okabe-
-# Ito's own 8 -- the frontier can grow (e.g. a new architecture that's simply the fastest
-# thing benchmarked joins it at the fast end even if nothing else changes), so this needs
-# headroom rather than a fixed 8. Everything not in the focus set still shares one neutral
-# gray (GRAY, below) rather than drawing its own color, which is what keeps a 12+-way
-# pareto scatter readable instead of a color-legend soup.
-FOCUS_PALETTE = (
-    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#000000", "#B5A600",
-    "#9467BD", "#8C564B", "#17BECF", "#7F7F7F",
+PALETTE = (
+    "#0072B2",
+    "#E69F00",
+    "#009E73",
+    "#D55E00",
+    "#CC79A7",
+    "#56B4E9",
+    "#666666",
+    "#A6761D",
+    "#332288",
 )
-GRAY = "#B0B0B0"
-DARK_GRAY = "#595959"
-
-# Kept in the comparison even when they're not Pareto-optimal on speed/KL: NSF-Q is the
-# architecture's own documented training-instability cautionary tale (FINDING.md), and
-# DF-N/DF-L are the direct "explicit discretized density" counterparts to the NSF coupling
-# flows -- worth seeing side by side against NSF-L/NSF-RQS even though neither wins on
-# speed or KL here.
-ALWAYS_SHOW = ("NSFQuadratic", "DFL")
-
-# Dropped from every figure (32-bin DF-N is dominated by its 16-bin sibling).
-EXCLUDE = ("DFN",)
-
-
-# Figure order (images grid, table, legend): grouped by family.
-DISPLAY_ORDER = (
-    "DFN", "DFN16", "DFL", "DFL16",
-    "NSFLinear", "NSFQuadratic", "NSFRQS",
-    "TMM",
-    "HDF", "HDFFast", "HDFFastest",
-    "HGGrid", "HGGridFast", "HGGridFastest",
+plt.rcParams.update(
+    {
+        "font.family": "DejaVu Sans",
+        "font.size": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "pdf.fonttype": 42,
+        "savefig.facecolor": "white",
+    }
 )
 
 
-def find_output_directory(parser: argparse.ArgumentParser) -> Path:
-    """Newest results.json under HERE, else HERE/output (benchmark.py's default)."""
-    candidates = [
-        p
-        for p in HERE.glob("**/results.json")
-        if not any(part.startswith(".") or part == "__pycache__" for part in p.parts)
-    ]
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_mtime).parent
-    if (HERE / "output" / "results.json").exists():
-        return HERE / "output"
-    parser.error(
-        f"no results.json found under {HERE} (searched '**/results.json' and 'output/'); "
-        "run benchmark.py first or pass an explicit output directory"
-    )
-    raise AssertionError("unreachable")
-
-
-def style_log_axis(axis) -> None:
-    """Sub-decade ticks (1-2-5) so a log axis reads as plain numbers instead of sparse
-    powers of ten, matching lab-neural-importance-sampling/figures' convergence plots."""
-    axis.set_major_locator(LogLocator(subs=(1, 2, 5)))
-    axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-    axis.set_minor_formatter(NullFormatter())
-
-
-def pearson_chi2(output: Path, name: str, masses: np.ndarray) -> float | None:
-    """Pearson chi^2 divergence chi2(p_ref || q) = integral (p - q)^2 / q dx, by midpoint
-    quadrature on the reference's texel grid. Equals Var_{x~q}[p(x)/q(x)] (the IS-ratio
-    variance) for normalized q, without Monte-Carlo noise. Model density comes from the saved
-    final log-pdf grid, so no GPU rerun is needed."""
-    path = output / f"{name}_final_logpdf.npy"
-    if not path.exists():
-        return None
-    q = np.exp(np.load(path).astype(np.float64))
-    p = masses.astype(np.float64) * masses.size
-    return float(np.sum((p - q) ** 2 / np.maximum(q, 1e-300)) / masses.size)
-
-
-def metric_table(report: dict, output: Path | None = None) -> dict[str, dict]:
-    """Flatten each architecture's nested results.json fields into one dict of the scalars
-    every figure below needs (kl, variance, timings, params), keyed by architecture name.
-    None for any field that's missing/non-finite, so callers can filter rather than crash."""
-    out = {}
-    masses = np.load(output / "reference_masses.npy") if output is not None else None
+def metric_table(report: dict, output: Path) -> dict[str, dict]:
+    """Use deterministic texel quadrature for Pearson χ²; keep sample checks separate."""
+    masses = np.load(output / "reference_masses.npy")
+    metrics = {}
     for name, result in report["architectures"].items():
-        meta = result.get("metadata", {})
-        timing = result.get("timing", {})
-        final = result.get("final_metrics", {})
-        eval_stats = timing.get("pdf_evaluation", {})
-        sample_stats = timing.get("sampling", {})
-
-        def finite(x):
-            return float(x) if isinstance(x, (int, float)) and np.isfinite(x) else None
-
-        sample_throughput = sample_stats.get("throughput_per_s")
-        eval_throughput = eval_stats.get("throughput_per_s")
-        sample_mrays = finite(sample_throughput / 1e6) if sample_throughput else None
-        variance = finite(final.get("sample_importance_ratio_variance"))
-        if output is not None:
-            quad = pearson_chi2(output, name, masses)
-            variance = finite(quad) if quad is not None else variance
-
-        # benchmark.py's own "mean_ms" field (time_kernel(), ~line 709) really is
-        # milliseconds (mean GPU seconds for one --timing-workload=4096-ray batch
-        # dispatch, times 1000) despite reading as a suspiciously tiny number -- e.g. a
-        # 4096-ray batch at ~400 Msamples/s legitimately takes ~0.01 ms (10 microseconds),
-        # not the 0.01 NANOseconds a bare "[us]" label without this x1000 would imply
-        # (physically impossible: faster than a single GPU clock cycle). Converted to
-        # actual microseconds here so the table's "[us]" columns show what they claim to.
-        def batch_us(stats: dict) -> float | None:
-            mean_ms = finite(stats.get("mean_ms"))
-            return mean_ms * 1000.0 if mean_ms is not None else None
-
-        out[name] = {
-            "params": meta.get("trainable_parameters"),
-            "buffer_fp16": meta.get("parameter_elements_fp16"),
-            "train_ms": finite(timing.get("mean_training_ms_per_update")),
-            "eval_us": batch_us(eval_stats),
-            "eval_mrays": finite(eval_throughput / 1e6) if eval_throughput else None,
-            "sample_us": batch_us(sample_stats),
-            "sample_mrays": sample_mrays,
-            "kl": finite(final.get("kl_divergence")),
-            "variance": variance,
-            "degenerate": finite(final.get("sample_importance_ratio_degenerate_fraction")),
-            "eqtime_var": eqtime_variance(variance, sample_mrays),
+        logpdf = np.load(output / f"{name}_final_logpdf.npy").astype(np.float64)
+        q = np.exp(logpdf) / masses.size
+        with np.errstate(divide="ignore", invalid="ignore"):
+            integrand = np.where(q > 0, (masses - q) ** 2 / q, np.where(masses > 0, np.inf, 0))
+        chi2 = float(np.sum(integrand))
+        timing = result["timing"]
+        metrics[name] = {
+            "kl": result["final_metrics"]["kl_divergence"],
+            "variance": max(0.0, chi2),
+            "sample_mrays": timing["sampling"]["throughput_per_s"] / 1e6,
+            "eval_mrays": timing["pdf_evaluation"]["throughput_per_s"] / 1e6,
+            "train_ms": timing["mean_training_ms_per_update"],
+            "params": result["metadata"]["trainable_parameters"],
+            "degenerate": result["final_metrics"]["sample_importance_ratio_degenerate_fraction"],
         }
-    return out
-
-
-def eqtime_variance(variance: float | None, sample_mrays: float | None) -> float | None:
-    """Sampling cost of Pearson chi^2: chi2 / (Tsamples/s) = chi2 x (ps per sample). This is
-    chi^2 PER unit of sampling throughput, not a chi^2 at some time -- the estimator's
-    variance after a fixed time budget T is chi2 * t_sample / T, so ranking by this number
-    ranks by equal-time estimator variance for any budget. Lower is better. Constant-cost
-    curves are straight diagonals on the log-log pareto plot."""
-    if variance is None or sample_mrays is None or sample_mrays <= 0:
-        return None
-    return variance * 1e6 / sample_mrays
+    return metrics
 
 
 def pareto_frontier(metrics: dict[str, dict]) -> list[str]:
-    """Architecture names on the (sampling speed, IS-ratio variance) Pareto frontier:
-    maximize sample_mrays, minimize variance. Returned fastest-first. A point is on the
-    frontier iff no faster point also beats it on variance -- equivalently, walking
-    fastest-to-slowest, it's a new running minimum of variance.
-
-    Variance (not KL) is the criterion pareto.pdf actually plots and this frontier is
-    drawn on: it's the quantity a real importance-sampling renderer pays for (Var(ratio)
-    directly sets estimator noise for a fixed sample count), where KL is a deterministic
-    grid-quadrature quantity with no sampling-cost interpretation. On this benchmark's
-    data the two rankings happen to pick the same architectures, but variance is the
-    principled choice, not a coincidence."""
-    candidates = [n for n, m in metrics.items() if m["sample_mrays"] is not None and m["variance"] is not None]
-    ordered = sorted(candidates, key=lambda n: metrics[n]["sample_mrays"], reverse=True)
-    frontier = []
-    best_variance = float("inf")
-    for name in ordered:
-        if metrics[name]["variance"] < best_variance:
-            frontier.append(name)
-            best_variance = metrics[name]["variance"]
-    return frontier
+    """Maximize throughput and minimize variance, excluding non-finite sample-ratio runs."""
+    reliable = {name: m for name, m in metrics.items() if m["degenerate"] == 0}
+    return [
+        name
+        for name, m in reliable.items()
+        if np.isfinite(m["variance"])
+        and not any(
+            other != name
+            and n["sample_mrays"] >= m["sample_mrays"]
+            and n["variance"] <= m["variance"]
+            and (n["sample_mrays"] > m["sample_mrays"] or n["variance"] < m["variance"])
+            for other, n in reliable.items()
+        )
+    ]
 
 
-def plot_convergence(output: Path, report: dict, entropy: float, focus: list[str], colors: dict[str, str]) -> None:
-    """KL(target || model) vs. cumulative training GPU time, one line per focus arch.
-
-    GPU seconds (not optimizer step) is the x-axis: benchmark.py's --seconds-per-method
-    budgets exactly this quantity (GPU-timestamp training-kernel time, not wall-clock),
-    so under the default equal-time run every line should reach roughly the same
-    right-hand edge, and step count alone wouldn't compare architectures that cost a
-    different amount per step (e.g. NSF-RQS's train_ms is ~4x TMM's, see table.pdf).
-    """
-    fig, ax = plt.subplots(figsize=(7.6, 5.4), constrained_layout=True)
-    for name in focus:
-        rows = report["architectures"][name]["checkpoints"]
-        # Skip checkpoint 0 (pre-training init): gpu_seconds is 0 there, unplaceable on
-        # log-x, and carries no training-dynamics information.
-        rows = [r for r in rows if r["cumulative_training_gpu_seconds"] > 0]
-        x = [r["cumulative_training_gpu_seconds"] for r in rows]
-        y = [max(r["nll"] - entropy, KL_FLOOR) for r in rows]
-        ax.plot(x, y, color=colors[name], lw=2.0, label=LABELS.get(name, name))
-
-    ax.set(xlabel="training time [GPU s]", ylabel="KL(target || model)")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.grid(True, which="both", color="0.9", lw=0.5)
-    style_log_axis(ax.xaxis)
-    style_log_axis(ax.yaxis)
-    ax.legend(frameon=False, fontsize=12)
-    fig.savefig(output / "convergence.pdf")
+def save_figure(fig, output: Path, name: str) -> None:
+    fig.savefig(output / f"{name}.png", dpi=180, bbox_inches="tight")
+    fig.savefig(output / f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
-def label_push_direction(name: str, positions_log: dict[str, tuple[float, float]]) -> tuple[float, float, str, str]:
-    """(dx, dy, ha, va) offset-points tuple for ax.annotate, pointing away from `name`'s
-    nearest neighbor among `positions_log` (every plotted point's (log10 x, log10 y)) --
-    whichever axis that neighbor is closer on, in SCREEN terms: a neighbor with smaller
-    data-y is above (variance's y-axis is inverted, lower = better = higher on screen), a
-    neighbor with smaller data-x is to the left (x-axis is not inverted)."""
-    x, y = positions_log[name]
-    other = min(
-        (positions_log[n] for n in positions_log if n != name),
-        key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2,
-        default=None,
-    )
-    if other is None:
-        return (0, 22, "center", "bottom")
-    ddx, ddy = x - other[0], y - other[1]
-    # 22-24pt, well past the 10-12pt a bare label would need: has to clear not just the
-    # label's own marker but the NEIGHBOR's bubble radius too (trainable params ranges
-    # ~5x across this benchmark's architectures, and NSF-RQS's own bubble -- the biggest
-    # in this dataset -- extends most of the way to its closest neighbors regardless of
-    # which way THEIR label is pushed; see git history).
-    if abs(ddy) >= abs(ddx):
-        return (0, -22, "center", "top") if ddy >= 0 else (0, 22, "center", "bottom")
-    return (24, 0, "left", "center") if ddx >= 0 else (-24, 0, "right", "center")
-
-
-# Hand-tuned label placement for architectures whose automatic push collides in the
-# crowded high-quality cluster.
-LABEL_OVERRIDES = {
-    "HGGridFast": (14, 4, "left", "center"),
-    "HDFFastest": (14, -2, "left", "center"),
-}
-
-
-def plot_pareto(
-    output: Path, metrics: dict[str, dict], frontier: list[str], focus: list[str], colors: dict[str, str]
-) -> None:
-    """Sampling speed vs. IS-ratio variance for every architecture; bubble area encodes
-    trainable parameter count. Both axes log-scaled specifically so that a line of constant
-    eq-time achieved variance (variance / (throughput * budget) -- see eqtime_variance(),
-    the same quantity table.pdf's "eq-time IS var" column reports) is a straight diagonal:
-    variance = (eqtime_var * budget) * throughput is linear in log-log space. A few of
-    those diagonals are drawn as reference -- a point's perpendicular distance below one
-    tells you it beats that eq-time variance, which speed and variance alone (as separate
-    axes) don't make visually obvious.
-
-    Three tiers, to keep a 12-point scatter legible instead of a 12-label pileup:
-    `frontier` (this data's own Pareto-optimal set) is bold, connected, and labeled;
-    `focus` minus `frontier` (the always-shown-but-dominated architectures) gets a plain
-    colored dot with a small label; everything else is an unlabeled gray dot, named in a
-    caption instead of fighting for space on the plot itself."""
-    all_names = [n for n in focus if metrics[n]["sample_mrays"] is not None and metrics[n]["variance"] is not None]
-    params = [metrics[n]["params"] for n in all_names if metrics[n]["params"] is not None]
-    lo, hi = min(params), max(params)
-
-    def size(p: int) -> float:
-        t = 0.0 if hi <= lo else (p - lo) / (hi - lo)
-        return 70.0 + 330.0 * t
-
-    fig, ax = plt.subplots(figsize=(9.0, 6.4), constrained_layout=True)
-
-    # Frontier line: `frontier` is already sorted fastest-first (pareto_frontier's own
-    # order), so plotting it as-is traces the efficient-frontier staircase from
-    # "fast/coarse" to "slow/best-quality" without a separate sort here.
-    frontier_x = [metrics[n]["sample_mrays"] for n in frontier]
-    frontier_y = [metrics[n]["variance"] for n in frontier]
-    ax.plot(frontier_x, frontier_y, color=DARK_GRAY, lw=1.0, ls="--", zorder=3)
-
-    # Non-frontier focus archs (NSF-Q/DF-N/DF-L): a plain dot plus a small, non-bold label
-    # offset consistently below-right -- these sit well clear of the crowded frontier
-    # cluster (see the coordinates in results.json), so they don't need the frontier
-    # labels' collision-avoidance cycling.
-    for name in focus:
-        if name in frontier:
-            continue
-        m = metrics[name]
-        ax.scatter(m["sample_mrays"], m["variance"], s=size(m["params"]), color=colors[name], edgecolor="white", linewidth=0.6, zorder=3)
-        ax.annotate(
-            LABELS.get(name, name),
-            (m["sample_mrays"], m["variance"]),
-            xytext=(7, -7),
-            textcoords="offset points",
-            fontsize=11,
+def plot_convergence(output: Path, report: dict, names: list[str], colors: dict) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4.7), layout="constrained")
+    entropy = report["reference_entropy"]
+    for name in names:
+        rows = report["architectures"][name]["checkpoints"][1:]
+        ax.plot(
+            [r["cumulative_training_gpu_seconds"] for r in rows],
+            [max(r["nll"] - entropy, 1e-5) for r in rows],
             color=colors[name],
-            ha="left",
-            va="top",
-            zorder=3,
+            label=LABELS.get(name, name),
+            linewidth=1.7,
         )
+    ax.set(xlabel="Training GPU time (s)", ylabel="KL(target ‖ model) ↓", yscale="log")
+    ax.grid(alpha=0.18, which="both")
+    ax.legend(loc="upper left", bbox_to_anchor=(1, 1), frameon=False, fontsize=9)
+    save_figure(fig, output, "convergence")
 
-    # Direction of each frontier label is chosen per-point (push away from that point's
-    # own nearest neighbor among EVERYTHING plotted, gray dots included) rather than
-    # cycled by frontier position: which architectures end up adjacent in this data can
-    # shift as the frontier's own membership changes (e.g. a new architecture becoming
-    # the fastest point moves every later index by one), and a fixed cycle tuned to one
-    # frontier's shape breaks the moment that shape changes -- see git history for the
-    # DFN16 case that motivated this.
-    positions_log = {
-        n: (math.log10(metrics[n]["sample_mrays"]), math.log10(metrics[n]["variance"])) for n in all_names
-    }
-    for name in frontier:
+
+def plot_pareto(output: Path, metrics: dict, names: list[str]) -> None:
+    """Speed × inverse χ²: both improve toward the top right.
+
+    Color and diagonal guides show χ² / (samples/s × 1 ms), the expected
+    variance of the normalized importance-sampling estimator at equal time.
+    """
+    fig, ax = plt.subplots(figsize=(10, 5.6), layout="constrained")
+    speed = np.array([metrics[n]["sample_mrays"] / 1000 for n in names])
+    quality = np.array([1 / metrics[n]["variance"] for n in names])
+    # Gsamples/s × 1 ms = one million samples per unit of x.
+    # Multiplying variance by 1e9 leaves the plotted color value 1000/(x*y).
+    variance_nano = 1000 / (speed * quality)
+    norm = LogNorm(vmin=variance_nano.min() / 1.1, vmax=variance_nano.max() * 1.1)
+    cmap = plt.get_cmap("viridis_r")
+    ax.set(xscale="log", yscale="log")
+    xlim = (speed.min() / 1.1, speed.max() * 1.1)
+    ylim = (quality.min() / 1.2, quality.max() * 1.2)
+    ax.set(xlim=xlim, ylim=ylim)
+
+    x = np.geomspace(*xlim, 200)
+    for value in (3, 5, 8, 12, 20):
+        y = 1000 / (value * x)
+        visible = (y > ylim[0]) & (y < ylim[1])
+        if np.any(visible):
+            ax.plot(x[visible], y[visible], color="#bbbbbb", lw=0.9, ls=":", zorder=0)
+            idx = np.flatnonzero(visible)[int(0.7 * (len(np.flatnonzero(visible)) - 1))]
+            ax.text(
+                x[idx],
+                y[idx],
+                f"{value:g}",
+                fontsize=8,
+                color="#777777",
+                ha="center",
+                va="center",
+                bbox={"facecolor": "white", "edgecolor": "none", "pad": 1},
+            )
+
+    frontier = sorted(pareto_frontier(metrics), key=lambda n: metrics[n]["sample_mrays"])
+    ax.plot(
+        [metrics[n]["sample_mrays"] / 1000 for n in frontier],
+        [1 / metrics[n]["variance"] for n in frontier],
+        color="#555555",
+        ls="--",
+        lw=1,
+        zorder=1,
+    )
+    for i, name in enumerate(names):
         m = metrics[name]
+        point_color = cmap(norm(variance_nano[i]))
+        text_color = (
+            "black" if np.dot(point_color[:3], [0.2126, 0.7152, 0.0722]) > 0.55 else "white"
+        )
         ax.scatter(
-            m["sample_mrays"],
-            m["variance"],
-            s=size(m["params"]),
-            color=colors[name],
-            edgecolor="white",
-            linewidth=0.8,
-            zorder=4,
+            speed[i],
+            quality[i],
+            s=180,
+            color=point_color,
+            edgecolor=text_color,
+            linewidth=1,
+            label=f"{i + 1}  {LABELS.get(name, name)}" + (" *" if m["degenerate"] else ""),
         )
-        dx, dy, ha, va = label_push_direction(name, positions_log)
-        dx, dy, ha, va = LABEL_OVERRIDES.get(name, (dx, dy, ha, va))
         ax.annotate(
-            LABELS.get(name, name),
-            (m["sample_mrays"], m["variance"]),
-            xytext=(dx, dy),
-            textcoords="offset points",
-            fontsize=11,
+            str(i + 1),
+            (speed[i], quality[i]),
+            color=text_color,
+            ha="center",
+            va="center",
+            fontsize=8,
             fontweight="bold",
-            color=colors[name],
-            ha=ha,
-            va=va,
-            zorder=4,
         )
-
-    # Directionality goes in the axis labels themselves (lower = better on variance is
-    # already unusual enough to spell out) rather than floating corner annotations --
-    # those had nowhere to sit that stayed clear of the frontier cluster or the legends.
     ax.set(
-        xlabel="sampling throughput [Msamples/s]  (higher = faster)",
-        ylabel="Pearson χ² divergence  (lower = better)",
+        xlabel="Sampling throughput (billion samples/s) →", ylabel="Inverse Pearson χ² (1 / χ²) ↑"
     )
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.invert_yaxis()
-    style_log_axis(ax.xaxis)
-    style_log_axis(ax.yaxis)
-    ax.grid(True, which="both", color="0.92", lw=0.5)
-
-    ax.margins(x=0.08)
-    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-    xs = np.array(xlim)
-    # Constant sampling cost c = chi2 / (Tsamples/s)  =>  chi2 = c * throughput / 1e6.
-    ymin, ymax = min(ylim), max(ylim)
-    labeled = False
-    for cost in (2, 5, 10, 20, 50, 100):
-        ax.plot(xs, cost * xs / 1e6, color="0.75", lw=0.9, ls=":", zorder=1)
-        x_label = xs[1] * 0.985
-        y_label = cost * x_label / 1e6
-        if ymin <= y_label <= ymax:
-            ax.annotate(f"{cost:g}" + ("" if labeled else " χ² per Tsample/s"), (x_label, y_label), xytext=(0, 3), textcoords="offset points",
-                        fontsize=10, color="0.5", ha="right", va="bottom", zorder=1)
-            labeled = True
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
     for axis in (ax.xaxis, ax.yaxis):
-        axis.set_major_locator(LogLocator(subs=(1, 1.5, 2, 3, 5, 7)))
-        axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-
-    fig.savefig(output / "pareto.pdf")
-    plt.close(fig)
-
-
-def plot_images(output: Path, output_dir: Path, report: dict, focus: list[str]) -> None:
-    """Reference + focus-arch learned-density thumbnails on one shared colormap scale.
-
-    vmax comes from the reference panel's own 99.9th percentile, not maxed across model
-    panels -- otherwise one diverged/unstable model would dominate the shared scale and
-    wash out every healthy panel, reference included (see git history for the incident
-    this guarded against).
-    """
-    reference_pdf = np.exp(np.load(output_dir / "reference_logpdf.npy"))
-    vmax = max(float(np.nanpercentile(reference_pdf, 99.9)), 1e-6)
-    panels = [("reference", "reference", reference_pdf)]
-    for name in focus:
-        values = np.exp(np.load(output_dir / f"{name}_final_logpdf.npy"))
-        panels.append((name, LABELS.get(name, name), values))
-
-    ncols = min(3, len(panels))
-    nrows = -(-len(panels) // ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 4.8 * nrows), constrained_layout=True)
-    axes = np.atleast_1d(axes).ravel()
-
-    image = None
-    for axis, (name, label, values) in zip(axes, panels):
-        image = axis.imshow(values, origin="upper", vmin=0.0, vmax=vmax, cmap="magma")
-        axis.set_axis_off()
-        params = report["architectures"][name]["metadata"].get("trainable_parameters") if name != "reference" else None
-        title = "reference" if name == "reference" else f"{textwrap.fill(label, 26)}\n{params:,} params"
-        axis.set_title(title, fontsize=13)
-    for axis in axes[len(panels):]:
-        axis.set_axis_off()
-
-    fig.colorbar(image, ax=list(axes[: len(panels)]), shrink=0.85, label="density")
-    fig.savefig(output / "images.pdf")
-    plt.close(fig)
-
-
-def plot_table(output: Path, metrics: dict[str, dict], focus: list[str], colors: dict[str, str]) -> None:
-    """The focus architectures' numeric comparison as its own figure -- split out of the
-    density-map grid so images.pdf isn't squeezed to make room for caption text."""
-    columns = [
-        ("params", "params", "{:,.0f}", "min"),
-        ("kl", "KL", "{:.4f}", "min"),
-        ("variance", "Pearson χ²", "{:.4f}", "min"),
-        ("eqtime_var", "χ² per\nTsample/s", "{:.1f}", "min"),
-        ("train_ms", "train\n[ms]", "{:.3f}", "min"),
-        ("eval_us", "eval\n[µs]", "{:.2f}", "min"),
-        ("sample_us", "sample\n[µs]", "{:.2f}", "min"),
-        ("sample_mrays", "sample\n[Msamples/s]", "{:.1f}", "max"),
-    ]
-    best = {}
-    for key, _, _, direction in columns:
-        values = [(metrics[n][key], n) for n in focus if metrics[n][key] is not None]
-        if not values:
-            continue
-        best[key] = (min if direction == "min" else max)(values)[1]
-
-    cell_text = []
-    for name in focus:
-        m = metrics[name]
-        row = [LABELS.get(name, name)]
-        for key, _, fmt, _ in columns:
-            value = m[key]
-            row.append("n/a" if value is None else fmt.format(value))
-        cell_text.append(row)
-
-    # Arch names now carry the full cascade geometry (e.g. "HDF 4x4>4x4>4x4"), much wider
-    # than the rest of the (mostly numeric) columns -- widen the figure for that one column
-    # and let auto_set_column_width fit each column to its actual longest cell instead of
-    # giving every column the same share of the figure.
-    arch_width = max(len(row[0]) for row in cell_text + [["arch"]])
-    fig, ax = plt.subplots(figsize=(0.2 * arch_width + 1.6 * len(columns), 0.9 + 0.42 * len(focus)))
-    ax.set_axis_off()
-    table = ax.table(
-        cellText=cell_text,
-        colLabels=["arch"] + [label for _, label, _, _ in columns],
-        loc="center",
-        cellLoc="center",
-        edges="horizontal",
+        axis.set_major_locator(LogLocator(base=10, subs=(1, 2, 3, 4, 5, 6, 8)))
+        axis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+        axis.set_minor_formatter(NullFormatter())
+    ax.grid(alpha=0.12, which="both")
+    ax.text(
+        0.98,
+        0.97,
+        "Better speed and fit ↗",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        color="#555555",
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.auto_set_column_width(col=list(range(len(columns) + 1)))
-    table.scale(1, 2.0)
+    ax.legend(loc="upper left", bbox_to_anchor=(1, 1), frameon=False, fontsize=9)
+    scale = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    colorbar = fig.colorbar(
+        scale,
+        ax=ax,
+        location="bottom",
+        pad=0.08,
+        fraction=0.07,
+        ticks=[v for v in (3, 5, 8, 12, 20) if norm.vmin <= v <= norm.vmax],
+    )
+    colorbar.ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+    colorbar.ax.xaxis.set_minor_formatter(NullFormatter())
+    colorbar.set_label("Expected variance after 1 ms = χ² / (throughput × 1 ms)  [×10⁻⁹] ↓")
+    if any(m["degenerate"] for m in metrics.values()):
+        fig.text(
+            0.02,
+            -0.02,
+            "* Non-finite sample ratios; excluded from frontier. Colors assume a valid sampler.",
+            fontsize=9,
+        )
+    save_figure(fig, output, "pareto")
 
-    for (r, c), cell in table.get_celld().items():
-        cell.set_linewidth(0.7 if r in (0, len(cell_text)) else 0.4)
-        if r == 0:
-            cell.set_text_props(fontweight="bold")
-            continue
-        name = focus[r - 1]
-        if c == 0:
-            cell.set_text_props(color=colors[name], fontweight="bold")
-        else:
-            key = columns[c - 1][0]
-            if best.get(key) == name:
-                cell.set_text_props(fontweight="bold")
 
-    fig.savefig(output / "table.pdf", bbox_inches="tight")
-    plt.close(fig)
+def plot_images(output: Path, names: list[str]) -> None:
+    """Shared linear density scale; resize only for display, keeping raw arrays intact."""
+    reference = np.exp(np.load(output / "reference_logpdf.npy"))
+    panels = [("Target", reference)]
+    for name in names:
+        panels.append(
+            (LABELS.get(name, name), np.exp(np.load(output / f"{name}_final_logpdf.npy")))
+        )
+    cols = 5
+    rows = (len(panels) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(14, rows * 3), layout="constrained")
+    for ax in axes.flat:
+        ax.set_axis_off()
+    for ax, (label, density) in zip(axes.flat, panels):
+        thumbnail = Image.fromarray(density.astype(np.float32))
+        thumbnail.thumbnail((512, 512), Image.Resampling.BOX)
+        im = ax.imshow(np.asarray(thumbnail), cmap="magma", vmin=0, vmax=float(reference.max()))
+        ax.set_title(label, fontsize=9, pad=6)
+    fig.colorbar(im, ax=list(axes.flat), shrink=0.8, label="Probability density (shared scale)")
+    save_figure(fig, output, "images")
 
 
-def format_summary_table(report: dict, output: Path | None = None) -> str:
-    """Markdown comparison table (arch, params, timing, quality) for ALL architectures --
-    mirrors the hand-written tables in FINDING.md, so a sweep's results.json can be turned
-    into a pasteable table without re-deriving the columns by hand. Unfiltered (unlike the
-    four focus-only PDFs above): this is the raw record of everything that ran."""
-    headers = [
-        "arch", "params", "buffer (fp16)", "train ms/step",
-        "eval us", "eval Msamples/s", "sample us", "sample Msamples/s", "KL", "Pearson chi2",
-        "chi2 per Tsample/s",
+def format_summary_table(report: dict, output: Path) -> str:
+    metrics = metric_table(report, output)
+    lines = [
+        "| Configuration | Parameters | KL ↓ | χ² ↓ | Train ms/update ↓ | Eval M/s ↑ | Sample M/s ↑ | Non-finite ratios |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-    for name, m in metric_table(report, output).items():
-        def num(x, nd=4):
-            return "n/a" if x is None else f"{x:,.{nd}f}" if isinstance(x, float) else f"{x:,}"
-
-        row = [
-            name,
-            num(m["params"], 0),
-            num(m["buffer_fp16"], 0),
-            num(m["train_ms"]),
-            num(m["eval_us"], 2),
-            num(m["eval_mrays"], 2),
-            num(m["sample_us"], 2),
-            num(m["sample_mrays"], 2),
-            num(m["kl"]),
-            num(m["variance"], 3),
-            "n/a" if m["eqtime_var"] is None else f"{m['eqtime_var']:.2f}",
-        ]
-        lines.append("| " + " | ".join(row) + " |")
+    for name, m in metrics.items():
+        lines.append(
+            f"| {LABELS.get(name, name)} | {m['params']:,} | {m['kl']:.4f} | "
+            f"{m['variance']:.4f} | {m['train_ms']:.3f} | "
+            f"{m['eval_mrays']:.1f} | {m['sample_mrays']:.1f} | {m['degenerate']:.2%} |"
+        )
     return "\n".join(lines)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("output_directory", type=Path, nargs="?", default=None)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output_directory", type=Path, nargs="?", default=HERE / "output")
     args = parser.parse_args()
-    output = args.output_directory or find_output_directory(parser)
+    output = args.output_directory
     report = json.loads((output / "results.json").read_text())
-    reference = np.load(output / "reference_logpdf.npy")
-    entropy = -float(
-        np.sum(
-            np.load(output / "reference_masses.npy")[np.isfinite(reference)]
-            * reference[np.isfinite(reference)],
-            dtype=np.float64,
-        )
-    )
-
-    metrics = {n: m for n, m in metric_table(report, output).items() if n not in EXCLUDE}
-    frontier = pareto_frontier(metrics)
-    if len(metrics) <= len(FOCUS_PALETTE):
-        focus = frontier + [n for n in metrics if n not in frontier]  # small run: show everything
-    else:
-        focus = frontier + [n for n in ALWAYS_SHOW if n in metrics and n not in frontier]
-    if len(focus) > len(FOCUS_PALETTE):
-        raise ValueError(
-            f"{len(focus)} focus architectures ({', '.join(focus)}) but FOCUS_PALETTE only "
-            f"has {len(FOCUS_PALETTE)} colors -- add another distinguishable hue there"
-        )
-    focus.sort(key=lambda n: DISPLAY_ORDER.index(n) if n in DISPLAY_ORDER else len(DISPLAY_ORDER))
-    colors = dict(zip(focus, FOCUS_PALETTE))
-
-    plot_convergence(output, report, entropy, focus, colors)
-    plot_pareto(output, metrics, frontier, focus, colors)
-    plot_images(output, output, report, focus)
-    plot_table(output, metrics, focus, colors)
-
+    names = [n for n in ARCHITECTURES if n in report["architectures"]]
+    names += [n for n in report["architectures"] if n not in names]
+    colors = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(names)}
+    metrics = metric_table(report, output)
+    plot_convergence(output, report, names, colors)
+    plot_pareto(output, metrics, names)
+    plot_images(output, names)
     table = format_summary_table(report, output)
     (output / "summary.md").write_text(table + "\n")
-
-    print(f"Pareto-optimal on sampling speed vs. IS-ratio variance: {', '.join(frontier)}")
-    print(f"Also shown (not Pareto-optimal here): {', '.join(n for n in focus if n not in frontier)}")
-    print(f"wrote {output / 'convergence.pdf'}, {output / 'pareto.pdf'}, {output / 'images.pdf'}, {output / 'table.pdf'}")
     print(table)
-    print(f"wrote {output / 'summary.md'}")
+    print("Sampling/variance Pareto frontier:", ", ".join(pareto_frontier(metrics)))
+    print(f"Wrote PNG/PDF figures and summary.md to {output}")
 
 
 if __name__ == "__main__":

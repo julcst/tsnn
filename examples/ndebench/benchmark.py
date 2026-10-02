@@ -23,58 +23,10 @@ import slangpy as spy
 from PIL import Image
 from tqdm import tqdm
 
+from models import ARCHITECTURES, MLP_LAYOUTS
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-
-# Architectures wired into the NDEBENCH_*_KERNEL macros (one struct per
-# architectures/<name>.slang, implementing IArchitecture).
-ARCHITECTURES = (
-    "TMM",
-    "HGGrid",
-    "DFN",
-    "DFL",
-    "NSFLinear",
-    "NSFQuadratic",
-    "NSFRQS",
-    "HDF",
-    "HDFG4L3",
-    "HDFG3L4",
-    "HDFG4L3B",
-    "HDFG3L4B",
-    "HDFG4L3S",
-    "HGGridG2L3",
-    "HGGridG2L3B",
-    "HGGridG4L2",
-    "HGGridG4L2B",
-    "HGGridG4L2S",
-    # Winners of a depth/width/gaussian-count/geometry screening sweep -- see
-    # FINDING.md's HDF/HGGrid optimal-config entry and this file's
-    # *_levels_layout() helpers.
-    "HDFFastest",
-    "HDFFast",
-    "HGGridFastest",
-    "HGGridFast",
-    # "Discretized GMM": the cell itself is chosen by a small CONTINUOUS
-    # TruncatedGMM (sample it, round the draw onto a 16x16 grid) instead of a
-    # learned NxN histogram -- see architectures/HGGridGMM.slang. As distinct
-    # from HGGridFast's 2-level histogram cascade to a coarser per-level 4x4.
-    "HGGridGMM16",
-    "HGGridGMM16Fast",
-    "HGGridGMM16KC24",
-    # Follow-up to the sweep above: pushes HGGridFast's K lever further
-    # (K=12/16) and applies HDFLevels' "narrow cascade at the SAME finest
-    # resolution" pattern to HGGrid for the first time (G4L3, res 64) --
-    # see architectures/HGGridLevels.slang's own comments on these typealiases.
-    "HGGridFastK12",
-    "HGGridFastK16",
-    "HGGridG4L3",
-    # Bin-matched to NSFLinear's kNumBins=16, isolating "explicit histogram/piecewise-
-    # linear density vs. NSF-L's coupling-flow spline" from "resolution" -- see FINDING.md's
-    # DF-vs-NSF training-speed entry (DFN/DFL's default 32 bins pay for 2x NSF-L's
-    # Histogram<K>::eval/sample unrolled-loop width, autodiff'd every training step).
-    "DFN16",
-    "DFL16",
-)
 
 # Module and entry-point prefix each REGISTRY kind's kernel lives under,
 # mirroring the *_KERNEL macro invocations in the corresponding .slang file
@@ -100,122 +52,30 @@ def aligned4(n: int) -> int:
     return (n + 3) & ~3
 
 
-# Per-architecture MLP shapes as (input, hidden, depth, output), one tuple per
-# TSNN.Utils.MLP<> block, in the same order each architecture's own .slang
-# file chains them (e.g. DFN's XNet then YNet). Mirrors the `typealias ... =
-# MLP<...>` lines in examples/ndebench/architectures/*.slang -- kept in sync
-# by hand since Slang has no host-side reflection for this; a mismatch here
-# throws in compute_layout's caller (the cross-check against the shader's own
-# getParamCount(), see make_runner) rather than silently mis-sizing buffers.
-def hdf_levels_layout(g: int, l: int, hid: int, kbins: int, depth: int = 3) -> list[tuple[int, int, int, int]]:
-    """Mirrors architectures/HDFLevels.slang's HDFLevels<G,L,HID,ENC,KBINS,DEPTH>
-    MLP<> chain: root (1, HID, DEPTH, G*G) then L-1 x (1 + 2*KBINS, HID, DEPTH, G*G)."""
-    root = (1, hid, depth, g * g)
-    rest = (1 + 2 * kbins, hid, depth, g * g)
-    return [root] + [rest] * (l - 1)
-
-
-def hggrid_levels_layout(
-    g: int, l: int, hid: int, kbins: int, k: int, depth: int = 3
-) -> list[tuple[int, int, int, int]]:
-    """Mirrors architectures/HGGridLevels.slang's HGGridLevels<G,L,HID,ENC,KBINS,K,DEPTH>
-    MLP<> chain: hdf_levels_layout's own L-level histogram cascade, plus a final
-    continuous GMM head (1 + 2*KBINS, HID, DEPTH, K*5)."""
-    fine = (1 + 2 * kbins, hid, depth, k * 5)
-    return hdf_levels_layout(g, l, hid, kbins, depth) + [fine]
-
-
-MLP_LAYOUTS: dict[str, list[tuple[int, int, int, int]]] = {
-    "TMM": [(1, 32, 3, 16 * 5)],  # Net: K=16
-    "HGGrid": [(1, 32, 3, 64), (1 + 16, 32, 3, 4 * 5)],  # CoarseNet, FineNet: K=4
-    "DFN": [(1, 32, 3, 32), (1 + 12, 32, 3, 32)],  # XNet, YNet
-    "DFL": [(1, 32, 3, 32), (1 + 12, 32, 3, 32)],  # XNet, YNet
-    "NSFLinear": [(1 + 32, 32, 3, 16), (1 + 32, 32, 3, 16)],  # kMLP0, kMLP1
-    "NSFQuadratic": [(1 + 32, 32, 3, 33), (1 + 32, 32, 3, 33)],  # kSplineOut = 2*16+1
-    "NSFRQS": [(1 + 32, 32, 3, 47), (1 + 32, 32, 3, 47)],  # kSplineOut = 3*16-1
-    "HDF": [(1, 32, 3, 64), (1 + 16, 32, 3, 64)],  # CoarseNet, FineNet
-    # HDFLevels<G,L,HID,ENC,KBINS,DEPTH> variants (architectures/HDFLevels.slang);
-    # geometry/encoding in each typealias's own comment there. KBINS = G*(L-1)
-    # (one-hot, ENC=0) or the noted fixed width (one-blob, ENC=1).
-    "HDFG4L3": hdf_levels_layout(4, 3, 32, 8),  # one-hot(KBINS=8)
-    "HDFG3L4": hdf_levels_layout(3, 4, 32, 9),  # one-hot(KBINS=9)
-    "HDFG4L3B": hdf_levels_layout(4, 3, 32, 8),  # one-blob(KBINS=8)
-    "HDFG3L4B": hdf_levels_layout(3, 4, 32, 8),  # one-blob(KBINS=8)
-    "HDFG4L3S": hdf_levels_layout(4, 3, 16, 8),  # one-blob(KBINS=8), HID=16
-    "HDFFastest": hdf_levels_layout(4, 3, 32, 8, depth=2),
-    "HDFFast": hdf_levels_layout(8, 2, 32, 8, depth=2),
-    # HGGridLevels<G,L,HID,ENC,KBINS,K,DEPTH> variants (architectures/HGGridLevels.slang);
-    # geometry/encoding in each typealias's own comment there. KBINS = G*L (one-hot,
-    # ENC=0) or the noted fixed width (one-blob, ENC=1).
-    "HGGridG2L3": hggrid_levels_layout(2, 3, 32, 6, 4),  # one-hot(KBINS=6), K=4
-    "HGGridG2L3B": hggrid_levels_layout(2, 3, 32, 8, 4),  # one-blob(KBINS=8), K=4
-    "HGGridG4L2": hggrid_levels_layout(4, 2, 32, 8, 4),  # one-hot(KBINS=8), K=4
-    "HGGridG4L2B": hggrid_levels_layout(4, 2, 32, 8, 4),  # one-blob(KBINS=8), K=4
-    "HGGridG4L2S": hggrid_levels_layout(4, 2, 16, 8, 4),  # one-blob(KBINS=8), K=4, HID=16
-    "HGGridFastest": hggrid_levels_layout(8, 1, 32, 8, 4, depth=2),
-    "HGGridFast": hggrid_levels_layout(4, 2, 16, 8, 8),
-    # HGGridGMM<G,HID,KC,KF,DEPTH> (architectures/HGGridGMM.slang): coarse
-    # TruncatedGMM<KC> (rounded onto a GxG grid) + fine TruncatedGMM<KF> tail.
-    # MLP chain: CoarseNet (1, HID, DEPTH, KC*5), FineNet (1+2G, HID, DEPTH, KF*5).
-    "HGGridGMM16": [(1, 32, 3, 8 * 5), (1 + 32, 32, 3, 8 * 5)],
-    "HGGridGMM16Fast": [(1, 16, 2, 8 * 5), (1 + 32, 16, 2, 8 * 5)],
-    "HGGridGMM16KC24": [(1, 32, 3, 24 * 5), (1 + 32, 32, 3, 8 * 5)],
-    "HGGridFastK12": hggrid_levels_layout(4, 2, 16, 8, 12),
-    "HGGridFastK16": hggrid_levels_layout(4, 2, 16, 8, 16),
-    "HGGridG4L3": hggrid_levels_layout(4, 3, 16, 12, 8, depth=2),
-    # DFN/DFL with per-axis bin count K=16 instead of the default 32 (architectures/
-    # DFN.slang's DFNImpl<K>/DFL.slang's DFLImpl<K>), bin-matched to NSFLinear's
-    # kNumBins=16 -- see the ARCHITECTURES tuple's own comment.
-    "DFN16": [(1, 16, 3, 16), (1 + 12, 16, 3, 16)],  # XNet, YNet
-    "DFL16": [(1, 16, 3, 16), (1 + 12, 16, 3, 16)],  # XNet, YNet
-}
-
-
 def trainable_params(mlp_specs: list[tuple[int, int, int, int]]) -> int:
-    """Sum of weight+bias element counts (naive, not TrainingOptimal-padded) over every
-    MLP<INPUT,HIDDEN,DEPTH,OUTPUT> block in `mlp_specs` -- the actual number of
-    trainable parameters, as distinct from `parameter_elements_fp16` (compute_layout's
-    device-padded buffer size, which is larger due to TrainingOptimal's real per-matrix
-    byte size -- see compute_layout's own doc comment). Needs no device/GPU."""
+    """Weight and bias count, excluding device-specific matrix padding."""
     total = 0
     for input_dim, hidden, depth, output in mlp_specs:
-        for l in range(depth + 1):
-            in_size = input_dim if l == 0 else hidden
-            out_size = output if l == depth else hidden
+        for layer in range(depth + 1):
+            in_size = input_dim if layer == 0 else hidden
+            out_size = output if layer == depth else hidden
             total += in_size * out_size + out_size
     return total
 
 
-def compute_layout(device: spy.Device, mlp_specs: list[tuple[int, int, int, int]]) -> tuple[np.ndarray, int]:
-    """Per-layer (weightOffset, biasOffset) byte pairs for a chain of MLPs,
-    mirroring TSNN.Utils.MLP's __init -- except each layer's WEIGHT matrix is
-    sized via Device.get_coop_vec_matrix_size(TrainingOptimal) instead of the
-    naive `sizeof(half) * inSize * outSize` that __init itself uses.
+def compute_layout(
+    device: spy.Device, mlp_specs: list[tuple[int, int, int, int]]
+) -> tuple[np.ndarray, int]:
+    """Device-padded TrainingOptimal weight offsets and plain fp16 bias offsets.
 
-    That naive size is only correct for RowMajor. `coopVecOuterProductAccumulate`
-    (the backward pass's gradient scatter, see TrainNLL.slang) requires
-    TrainingOptimal on current hardware -- the Slang stdlib's own doc comment
-    on it says so -- and TrainingOptimal's real per-matrix byte size is
-    device-defined (there is no shader-side equivalent of this query), and can
-    be well above the naive count (e.g. on this GPU a 32x32 fp16 matrix needs
-    3584 bytes vs. 2048 naive; a 32x1 needs 512 vs. 64). Using the naive size
-    to lay out a TrainingOptimal buffer silently under-allocates every layer,
-    which was the actual root cause of the "DFN/DFL lower half washed out"
-    bug -- see FINDING.md's "ndebench: DFN/DFL's lower ~47% of rows..." entry
-    and its follow-up. Bias vectors are never TrainingOptimal-reordered/padded
-    (only matrices are), so they keep the naive size unchanged.
-
-    Returns (flat uint32 array of interleaved (weightOffset, biasOffset)
-    pairs -- one per layer, MLPs concatenated in `mlp_specs` order, suitable
-    for a `StructuredBuffer<uint2>` -- and the total size in fp16 half-units,
-    matching what IArchitecture.getParamCount() reports for the same layout).
-    """
+    Returns packed uint2 byte offsets and the total size in fp16 elements.
+    Query every matrix: naive row-major sizes underallocate TrainingOptimal buffers."""
     offsets: list[tuple[int, int]] = []
     byte_off = 0
     for input_dim, hidden, depth, output in mlp_specs:
-        for l in range(depth + 1):
-            in_size = input_dim if l == 0 else hidden
-            out_size = output if l == depth else hidden
+        for layer in range(depth + 1):
+            in_size = input_dim if layer == 0 else hidden
+            out_size = output if layer == depth else hidden
             weight_off = byte_off
             wsize = device.get_coop_vec_matrix_size(
                 out_size, in_size, spy.CoopVecMatrixLayout.training_optimal, spy.DataType.float16
@@ -410,19 +270,6 @@ class Runner:
                     "gWidth": self.width,
                     "gHeight": self.height,
                     "gCount": count,
-                    # gStreamOffset is a uint32 cbuffer field
-                    # (ImageSample.slang); callers compute it as
-                    # step * batch_size, which the equal-GPU-time training
-                    # budget can now run far enough (hundreds of thousands of
-                    # steps for a cheap-per-step architecture) to overflow
-                    # 2**32 -- slangpy's cursor write then raises
-                    # `std::bad_cast` instead of silently truncating. Wrap
-                    # explicitly: it is only a PCG32 stream-decorrelation
-                    # offset (PCG32(seed, gStreamOffset + tid.x) in
-                    # ImageSample.slang), so wrapping after ~4 billion
-                    # samples just means two steps very far apart in an
-                    # already-long run reuse the same stream slice --
-                    # inconsequential next to the alternative of crashing.
                     "gStreamOffset": stream_offset & 0xFFFFFFFF,
                     "gSeed": seed,
                 },
@@ -516,12 +363,6 @@ class Runner:
         group_size: int,
         seed: int,
     ) -> None:
-        # At least one full group_size-sized group, batched via train_group
-        # (see its doc comment) -- quantizing warmup to whole groups matters
-        # more than hitting `count` exactly, since the point is exercising
-        # the real loop's own checkpoint-group shape at production size, not
-        # a specific step count (warm()'s work is thrown away by reset()
-        # below regardless).
         step = 0
         while step < max(count, group_size):
             step = self.train_group(arch, step, group_size, lr, loss_scale, clip, seed)["step"]
@@ -603,8 +444,9 @@ def make_runner(
 
     def load(module: str, entry: str, source=None):
         return device.create_compute_kernel(
-            device.load_program(module_name=module, entry_point_names=[entry],
-                                additional_source=source)
+            device.load_program(
+                module_name=module, entry_point_names=[entry], additional_source=source
+            )
         )
 
     kernels = {
@@ -615,14 +457,6 @@ def make_runner(
         for kind, entry in REGISTRY[arch].items():
             kernels[entry] = load(MODULE_BY_KIND[kind], entry, source_by_arch[arch])
 
-    # Each architecture owns its own parameter-element count; buffers are
-    # sized to the largest one so every architecture's real weights fit,
-    # while gParamElementCount (in optimize_vars) stays per-architecture so
-    # the Adam sweep never walks past a smaller architecture's own tail.
-    # The metadata kernel re-derives the same count from `gLayout` on the
-    # shader side (T.getParamCount(layout), see IArchitecture.slang) -- kept
-    # as a live cross-check that MLP_LAYOUTS above hasn't drifted from the
-    # corresponding architectures/*.slang file's own MLP<> typealiases.
     meta = buffer(device, np.zeros(1, np.uint32), 4)
     elements_by_arch: dict[str, int] = {}
     padded_by_arch: dict[str, int] = {}
@@ -764,29 +598,9 @@ def timestamped_inference(
 def sample_importance_ratio_variance(
     r: Runner, arch: str, masses: np.ndarray, width: int, height: int, seed: int, count: int
 ) -> tuple[float, float, float]:
-    """Variance (and mean) of the importance-sampling ratio p_ref(x)/p_model(x)
-    for x drawn from the trained model's own sample() -- the standard
-    diagnostic for how well a learned sampling distribution matches its
-    target: a model that is locally under-confident where the target has
-    mass produces a long-tailed ratio and a large variance, even if its NLL
-    looks reasonable on average.
+    """Estimate Var[p_ref / p_model] from model samples.
 
-    p_ref is the same piecewise-constant-per-texel density
-    (masses*width*height) reference_logpdf uses, looked up by nearest texel
-    at each continuous sample coordinate.
-
-    A sample the model itself assigns exactly zero density (model_logpdf ==
-    -inf) makes the ratio a genuine +inf, not a numerical artifact of this
-    function -- observed in practice for a small fraction (~0.2-0.3%) of
-    TMM's own samples (TruncatedGMM.sample()'s inverse-normal-CDF step,
-    unrelated to this session's DFN/DFL work; not fixed here, flagged in
-    FINDING.md). One +inf silently NaNs np.var's mean-of-squares, which would
-    make the WHOLE architecture's reported variance meaningless instead of
-    just the offending samples'. Mirrors plot.py's own saturated-pixel-
-    fraction precedent: exclude non-finite ratios from the statistic and
-    report what fraction were excluded, rather than let a handful of
-    degenerate draws erase the signal from the rest.
-    """
+    Exclude non-finite ratios and report their fraction separately."""
     n = min(count, r.sample_out_count)
     layout = r.layout_by_arch[arch]
     r.kernels[REGISTRY[arch]["sample"]].dispatch(
@@ -801,17 +615,16 @@ def sample_importance_ratio_variance(
     r.device.wait()
     r.kernels[REGISTRY[arch]["eval"]].dispatch(
         thread_count=[n, 1, 1],
-        vars={"gParams": r.params, "gSamples": r.sample_out, "gLogPDFs": r.eval_out, "gLayout": layout},
+        vars={
+            "gParams": r.params,
+            "gSamples": r.sample_out,
+            "gLogPDFs": r.eval_out,
+            "gLayout": layout,
+        },
     )
     r.device.wait()
     xy = np.frombuffer(r.sample_out.to_numpy(), dtype=np.float32).reshape(-1, 2)[:n]
     model_logpdf = np.frombuffer(r.eval_out.to_numpy(), dtype=np.float32).copy()[:n]
-    # Clamp to [0, 1) BEFORE scaling by width/height and casting to int: a
-    # handful of samples can be a degenerate +-inf/NaN (see this function's
-    # docstring), and scaling an inf coordinate first, then casting that
-    # still-inf-or-overflowing float to int64, is undefined behavior (numpy
-    # warns "invalid value encountered in cast"). Clamping the coordinate
-    # itself first keeps every cast in-range.
     unit = np.nextafter(1.0, 0.0, dtype=np.float32)
     xy_clamped = np.nan_to_num(np.clip(xy, 0.0, unit), nan=0.0, posinf=unit, neginf=0.0)
     cols = np.clip((xy_clamped[:, 0] * width).astype(np.int64), 0, width - 1)
@@ -851,15 +664,9 @@ def run_architecture(
     initial, grid_time = r.eval_grid(arch)
     h, w = masses.shape
 
-    # Started here, after warmup and this architecture's initial grid eval --
-    # the clock every checkpoint's "wall_seconds" (below) and the equal-time
-    # training budget (further down) are both measured against. This is the
-    # ONLY seconds figure that actually reflects the equal-time budget: see
-    # checkpoint()'s docstring-style comment for why
-    # "cumulative_training_gpu_seconds" is a different, smaller number.
     wall_started = time.perf_counter()
 
-    def checkpoint(step: int, consumed: int, timing: float, eval_seconds: float) -> dict:
+    def checkpoint(step: int, consumed: int, timing: float) -> tuple[dict, np.ndarray]:
         logpdf, seconds = r.eval_grid(arch)
         nll = -float(
             np.sum(masses[masses > 0] * logpdf.reshape(h, w)[masses > 0], dtype=np.float64)
@@ -874,7 +681,7 @@ def run_architecture(
             # budgets equally across architectures (see the training-loop
             # comment below for why GPU time rather than wall-clock).
             "cumulative_training_gpu_seconds": timing,
-            "grid_evaluation_seconds": seconds + eval_seconds,
+            "grid_evaluation_seconds": seconds,
             # Wall-clock time, purely informational: how much real time this
             # checkpoint's slice of training + evaluation actually took,
             # Python/driver overhead and sync waits included. Not what the
@@ -900,28 +707,6 @@ def run_architecture(
     step = 0
     total_consumed = 0
 
-    # Equal-time mode (the default: args.steps left unset) bounds each
-    # architecture's training loop by GPU-measured training seconds
-    # (total_train, the same GPU-timestamp sum stored per checkpoint as
-    # "cumulative_training_gpu_seconds") instead of a fixed step count, so
-    # every method gets the same GPU compute budget regardless of its
-    # per-step cost -- fairer for comparing architectures whose per-step
-    # time varies a lot (see the timing table: NSFRQS/HGGrid run ~4-5x the
-    # per-update cost of TMM/DFL). Deliberately GPU time, not wall-clock:
-    # wall-clock also counts Python/driver dispatch overhead and CPU<->GPU
-    # sync waits, which are a per-call constant this benchmark's small
-    # per-step batches make disproportionately large -- not representative
-    # of a production inference/training loop's actual GPU cost, and it
-    # would unfairly penalize an architecture just for issuing more, smaller
-    # dispatches. total_train excludes checkpoint eval_grid() calls (a
-    # separate "grid_evaluation_seconds" figure) and, since it only starts
-    # accumulating once the training loop below begins -- after
-    # make_runner's one-time shared kernel compilation and after this
-    # architecture's own warmup -- it never counts compile time either.
-    # Checked at the top of the loop using the previous iteration's
-    # accumulated total, since a group's own GPU time is only known after it
-    # runs. Only `--smoke`'s forced `args.steps = 2` (and an explicit
-    # `--steps` override) still use the old fixed-step-count path.
     use_step_budget = args.steps is not None
     total_steps = args.steps if use_step_budget else None
     pbar_kwargs = (
@@ -955,7 +740,7 @@ def run_architecture(
             total_forward += result["forward"]
             total_opt += result["optimizer"]
             total_train += result["total"]
-            row, final = checkpoint(step, total_consumed, total_train, 0.0)
+            row, final = checkpoint(step, total_consumed, total_train)
             rows.append(row)
             if use_step_budget:
                 pbar.update(group_size)
@@ -1043,32 +828,18 @@ def main() -> None:
         "--seconds-per-method",
         type=float,
         default=5.0,
-        # Default deliberately much smaller than a wall-clock budget would be:
-        # GPU-measured seconds only count actual kernel time, so reaching even
-        # a modest target can take much longer in real wall-clock time for a
-        # cheap-per-step architecture -- e.g. an earlier 60-wall-second run's
-        # GPU-measured total ranged from ~16% (HGGrid) down to under 1% (DFL)
-        # of that wall time, so a 60 GPU-second target could take the better
-        # part of an hour of real time for the fastest architectures.
-        help="equal-time training budget per architecture, in GPU-measured seconds "
-        "(cumulative_training_gpu_seconds, not wall-clock -- production-representative GPU "
-        "compute, excluding Python/driver overhead and the one-time shared kernel-compile "
-        "cost); ignored when --steps is set",
+        help="training GPU seconds per architecture, excluding compilation and evaluation; "
+        "overridden by --steps",
     )
     p.add_argument("--evaluation-interval", type=int, default=64)
     p.add_argument(
         "--warmup-count",
         type=int,
         default=5,
-        help="minimum warmup steps before measurement starts; rounded up to a whole "
-        "multiple of --evaluation-interval, since warm() batches steps into "
-        "--evaluation-interval-sized groups (matching the measured training loop's own "
-        "checkpoint-group structure, so the driver's first-use cost for that batched-"
-        "dispatch-with-timestamp-queries shape is paid here instead of during the first "
-        "measured checkpoint)",
+        help="warmup steps, rounded up to a whole checkpoint group before resetting weights",
     )
     p.add_argument("--timing-repetitions", type=int, default=100)
-    p.add_argument("--timing-workload", type=int, default=4096)
+    p.add_argument("--timing-workload", type=int, default=262144)
     p.add_argument(
         "--variance-sample-count",
         type=int,
@@ -1085,7 +856,8 @@ def main() -> None:
         help="skip automatically running plot.py on the freshly written results",
     )
     args = p.parse_args()
-    validate() if args.validate else None
+    if args.validate:
+        validate()
     if args.validate and not args.smoke:
         print("CPU validation passed")
         return
